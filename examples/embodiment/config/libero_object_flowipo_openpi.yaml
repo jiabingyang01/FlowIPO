@@ -1,3 +1,13 @@
+# FlowIPO configuration for LIBERO Object tasks with OpenPi (π0)
+#
+# Key differences from PPO config:
+#   - loss_type: flow_ipo (velocity target interpolation, no policy gradient)
+#   - adv_type: not used (FlowIPO uses its own credit assignment)
+#   - No critic/value head (add_value_head: False)
+#   - FlowIPO-specific hyperparameters: flow_ipo_alpha, flow_ipo_beta_ref, etc.
+#
+# Usage: same as PPO config, just swap the config file name.
+
 defaults:
   - env/libero_object@env.train
   - env/libero_object@env.eval
@@ -22,8 +32,8 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_ppo_openpi"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    experiment_name: "libero_object_flowipo_openpi"
+    logger_backends: ["tensorboard"]
 
   max_epochs: 1000
   max_steps: -1
@@ -32,32 +42,41 @@ runner:
   val_check_interval: -1
   save_interval: 40
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  resume_dir: null
+  ckpt_path: null
 
 algorithm:
-  normalize_advantages: True
-  kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
+  # ==================== FlowIPO Core ====================
+  loss_type: flow_ipo                # switches to FlowIPO training branch
+  adv_type: gae                      # not actually used, kept for compatibility
+
+  # FlowIPO hyperparameters
+  flow_ipo_alpha: 2.0                # temperature for interpolation weight sharpness
+  flow_ipo_beta_ref: 0.995           # EMA rate for reference policy (slow)
+  flow_ipo_t_min: 0.2                # flow matching time sampling lower bound
+  flow_ipo_t_max: 0.8                # flow matching time sampling upper bound
+
+  # ==================== General ====================
+  normalize_advantages: True          # kept for compatibility
+  kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
   rollout_epoch: 8
-  eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+  eval_rollout_epoch: 1
 
   reward_type: chunk_level
-  logprob_type: chunk_level
+  logprob_type: chunk_level           # not used by FlowIPO, kept for compatibility
   entropy_type: token_level
 
   update_epoch: 4
-  adv_type: gae
-  loss_type: actor_critic
-  loss_agg_func: "token-mean" 
+  loss_agg_func: "token-mean"
   kl_beta: 0.0
-  entropy_bonus: 0
-  clip_ratio_high: 0.2
-  clip_ratio_low: 0.2
-  clip_ratio_c: 3.0
-  value_clip: 0.2
-  huber_delta: 10.0
+  entropy_bonus: 0                    # FlowIPO does not use entropy bonus
+  clip_ratio_high: 0.2               # not used by FlowIPO
+  clip_ratio_low: 0.2                # not used by FlowIPO
+  clip_ratio_c: 3.0                  # not used by FlowIPO
+  value_clip: 0.2                    # not used by FlowIPO
+  huber_delta: 10.0                  # not used by FlowIPO
 
   gamma: 0.99
   gae_lambda: 0.95
@@ -65,7 +84,7 @@ algorithm:
   filter_rewards: False
   rewards_lower_bound: 0.1
   rewards_upper_bound: 0.9
-  # params for generation
+
   sampling_params:
     do_sample: True
     temperature_train: 1.0
@@ -75,8 +94,6 @@ algorithm:
     repetition_penalty: 1.0
     add_BOS: False
 
-  # length argument for autoregressive sampling
-  # max length means max amount of tokens to generate
   length_params:
     max_new_token: null
     max_length: 1024
@@ -84,8 +101,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-
-  # Override the default values in env/libero_object
   train:
     total_num_envs: 64
     max_episode_steps: 240
@@ -110,7 +125,6 @@ rollout:
   unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
-
   model:
     model_path: "/DATA/disk0/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     precision: ${actor.model.precision}
@@ -119,22 +133,21 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 128
-  global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
+  global_batch_size: 2048
   seed: 42
   enable_offload: False
 
-  # Override the default values in model/pi0
   model:
     model_path: "/DATA/disk0/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
-    num_action_chunks: 5 # interface for the env
-    add_value_head: True
+    num_action_chunks: 5
+    add_value_head: False             # FlowIPO: no critic needed
     # openpi specific parameters
     openpi:
-      detach_critic_input: True
+      detach_critic_input: False      # no critic, so irrelevant
 
   optim:
     lr: 5.0e-6
-    value_lr: 1.0e-4
+    value_lr: 1.0e-4                  # not used (no critic)
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
@@ -142,11 +155,10 @@ actor:
     clip_grad: 1.0
     critic_warmup_steps: 0
 
-  # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

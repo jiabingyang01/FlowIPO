@@ -357,6 +357,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
+            # FlowIPO: store initial noise for reference action generation
+            "initial_noise": outputs["chains"][:, 0],  # chains[0] = initial noise ε₀
             "observation/image": env_obs["main_images"],
             "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
@@ -649,6 +651,62 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return suffix_out
+
+    def forward_velocity(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        FlowIPO: compute velocity prediction v_θ(x_t, t, s) for a given
+        noisy action x_t at timestep t.
+
+        This mirrors the SFT forward path (PI0Pytorch.forward) but only returns
+        the velocity prediction without computing loss.
+
+        Args:
+            forward_inputs: Dict containing observation data (images, state, tokens).
+            x_t: Noisy actions, shape [batch, action_horizon, action_dim].
+            timestep: Flow matching time t, shape [batch, 1] or [batch].
+
+        Returns:
+            v_theta: Predicted velocity, shape [batch, action_horizon, action_dim].
+        """
+        observation = self.input_transform(forward_inputs, transpose=False)
+        observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        device = x_t.device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+
+        # Embed prefix (images + language) with KV cache
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Embed suffix (state + x_t + timestep) and get velocity prediction
+        suffix_out = self.get_suffix_out(
+            state, prefix_pad_masks, past_key_values, x_t, timestep
+        )
+        v_theta = self.action_out_proj(suffix_out)
+        return v_theta
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):

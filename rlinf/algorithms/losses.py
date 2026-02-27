@@ -275,3 +275,47 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+@register_policy_loss("flow_ipo")
+def compute_flow_ipo_loss(
+    v_theta: torch.Tensor,
+    interpolated_target: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute FlowIPO loss: MSE between model velocity prediction and
+    interpolated velocity target.
+
+    L = E[ ||v_θ(x_t, t, s_i) - ṽ_i||² ]
+
+    where ṽ_i = w_i * u_i + (1 - w_i) * v_ref_i is the interpolated target
+    constructed in the training loop (fsdp_actor_worker).
+
+    Args:
+        v_theta: Model's velocity prediction, shape [batch, chunk, action_dim].
+        interpolated_target: Interpolated velocity target ṽ_i, same shape.
+        loss_mask: Optional mask for valid entries, shape [batch, ...].
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (flow_ipo_loss, metrics_dict)
+    """
+    # Per-element MSE
+    mse = (v_theta - interpolated_target).pow(2)
+
+    # Aggregate: masked mean over all dims
+    if loss_mask is not None:
+        # Expand loss_mask to match mse shape if needed
+        while loss_mask.dim() < mse.dim():
+            loss_mask = loss_mask.unsqueeze(-1)
+        loss_mask = loss_mask.expand_as(mse)
+        loss = (mse * loss_mask).sum() / (loss_mask.sum().clamp(min=1.0))
+    else:
+        loss = mse.mean()
+
+    metrics_data = {
+        "actor/flow_ipo_loss": loss.detach().item(),
+        "actor/velocity_mse": mse.detach().mean().item(),
+    }
+    return loss, metrics_data
