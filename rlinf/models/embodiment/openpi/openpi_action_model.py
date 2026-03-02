@@ -236,6 +236,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sft_forward(**kwargs)
         elif forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        elif forward_type == ForwardType.VELOCITY:
+            return self.forward_velocity(**kwargs)
         else:
             raise NotImplementedError
 
@@ -343,6 +345,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
         )  # policy input obs -> model input obs
+        # FlowIPO: cache processed obs (CPU tensors) to skip input_transform for ref actions
+        _cached_proc = {}
+        for _k, _v in processed_obs.items():
+            if isinstance(_v, dict):
+                for _sk, _sv in _v.items():
+                    if torch.is_tensor(_sv):
+                        _cached_proc[f"~{_k}~{_sk}"] = _sv
+            elif torch.is_tensor(_v):
+                _cached_proc[f"~{_k}"] = _v
         processed_obs = self.precision_processor(
             processed_obs
         )  # obs precision processor
@@ -359,6 +370,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "denoise_inds": outputs["denoise_inds"],
             # FlowIPO: store initial noise for reference action generation
             "initial_noise": outputs["chains"][:, 0],  # chains[0] = initial noise ε₀
+            # FlowIPO: store raw denoised actions for credit assignment (δ_i computation)
+            "action": outputs["actions"],  # [batch, action_horizon, action_dim]
             "observation/image": env_obs["main_images"],
             "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
@@ -368,6 +381,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
+        forward_inputs.update(_cached_proc)  # FlowIPO: cached processed obs
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"],
@@ -657,24 +671,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         forward_inputs: dict[str, torch.Tensor],
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        observation=None,
     ) -> torch.Tensor:
         """
         FlowIPO: compute velocity prediction v_θ(x_t, t, s) for a given
         noisy action x_t at timestep t.
 
-        This mirrors the SFT forward path (PI0Pytorch.forward) but only returns
-        the velocity prediction without computing loss.
-
         Args:
             forward_inputs: Dict containing observation data (images, state, tokens).
             x_t: Noisy actions, shape [batch, action_horizon, action_dim].
-            timestep: Flow matching time t, shape [batch, 1] or [batch].
+            timestep: Flow matching time t, shape [batch].
+            observation: Optional pre-processed Observation (skips input_transform).
 
         Returns:
             v_theta: Predicted velocity, shape [batch, action_horizon, action_dim].
         """
-        observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
+        if observation is None:
+            observation = self.input_transform(forward_inputs, transpose=False)
+            observation = _model.Observation.from_dict(observation)
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=False)
         )

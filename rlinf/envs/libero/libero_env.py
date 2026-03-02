@@ -47,6 +47,7 @@ class LiberoEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
+        self.single_task_id = cfg.get("single_task_id", None)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -137,10 +138,21 @@ class LiberoEnv(gym.Env):
             self._get_task_and_trial_ids_from_reset_state_ids(self.reset_state_ids)
         )
 
+    def _get_task_state_range(self, task_id):
+        """Return (low, high) reset_state_id range for a given task_id."""
+        low = int(self.cumsum_trial_id_bins[task_id - 1]) if task_id > 0 else 0
+        high = int(self.cumsum_trial_id_bins[task_id])
+        return low, high
+
     def _get_random_reset_state_ids(self, num_reset_states):
         if self.specific_reset_id is not None:
             reset_state_ids = self.specific_reset_id * np.ones(
                 (num_reset_states,), dtype=int
+            )
+        elif self.single_task_id is not None:
+            low, high = self._get_task_state_range(self.single_task_id)
+            reset_state_ids = self._generator.integers(
+                low=low, high=high, size=(num_reset_states,)
             )
         else:
             reset_state_ids = self._generator.integers(
@@ -149,7 +161,11 @@ class LiberoEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        reset_state_ids = np.arange(self.total_num_group_envs)
+        if self.single_task_id is not None:
+            low, high = self._get_task_state_range(self.single_task_id)
+            reset_state_ids = np.arange(low, high)
+        else:
+            reset_state_ids = np.arange(self.total_num_group_envs)
         valid_size = len(reset_state_ids) - (
             len(reset_state_ids) % self.total_num_processes
         )

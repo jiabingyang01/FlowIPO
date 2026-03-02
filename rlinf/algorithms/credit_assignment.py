@@ -13,18 +13,23 @@
 # limitations under the License.
 
 """
-FlowIPO credit assignment module.
+Credit assignment module for FlowIPO and FlowSAR.
 
-Computes per-step interpolation weights w_i based on:
-  1. Policy divergence: δ_i = ||a_i - a_i^ref||_2
-  2. Reward-directed credit: A_i = (2R - 1) * normalize(δ_i)
-  3. Interpolation weight: w_i = sigmoid(α * A_i) ∈ (0, 1)
+FlowIPO:
+  Computes per-step interpolation weights w_i based on:
+    1. Policy divergence: δ_i = ||a_i - a_i^ref||_2
+    2. Reward-directed credit: A_i = (2R - 1) * normalize(δ_i)
+    3. Interpolation weight: w_i = sigmoid(α * A_i) ∈ (0, 1)
 
-w_i → 1: reinforce current action (success + large divergence)
-w_i → 0: fall back to reference policy (failure + large divergence)
+FlowSAR:
+  Computes per-step credit assignment weights based on:
+    1. Reconstruction error e_i (policy confidence proxy)
+    2. Success: w_i = softmax(e_i / T) — uncertain but correct steps get high weight
+    3. Failure: w_i = softmax(-e_i / T) — confident but wrong steps get high weight
 """
 
 import torch
+import torch.nn.functional as F
 
 
 def compute_flow_ipo_weights(
@@ -85,3 +90,75 @@ def compute_flow_ipo_weights(
     weights = torch.sigmoid(alpha * credit)
 
     return weights
+
+
+def compute_flow_sar_weights(
+    recon_errors: torch.Tensor,
+    rewards: torch.Tensor,
+    temperature: float = 0.5,
+    w_min: float = 0.0,
+    w_max: float = 1.0,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute FlowSAR step-level credit assignment weights based on
+    reconstruction error and episode reward.
+
+    Success trajectories (R=1): uncertain-but-correct steps get high weight
+        w_i = softmax(e_i / T)
+    Failure trajectories (R=0): confident-but-wrong steps get high weight
+        w_i = softmax(-e_i / T)
+
+    Args:
+        recon_errors: Per-step reconstruction error, shape [n_steps, batch].
+        rewards: Episode-level reward, shape [batch] (binary 0/1).
+        temperature: Softmax temperature controlling weight sharpness.
+        w_min: Minimum weight for clipping (0 = no clipping).
+        w_max: Maximum weight for clipping (1 = no clipping).
+        eps: Small constant for numerical stability.
+
+    Returns:
+        weights: Per-step credit assignment weights, shape [n_steps, batch].
+        labels: Per-sample contrastive labels y_i = 2R - 1, shape [batch].
+    """
+    n_steps, batch_size = recon_errors.shape
+    rewards_float = rewards.float()
+
+    # Contrastive labels: y_i = 2R - 1 ∈ {-1, +1}
+    labels = 2.0 * rewards_float - 1.0  # [batch]
+
+    # Success mask and failure mask
+    success_mask = (rewards_float > 0.5)  # [batch]
+    failure_mask = ~success_mask
+
+    # Compute softmax weights per episode (across steps)
+    # recon_errors: [n_steps, batch] -> transpose to [batch, n_steps] for softmax
+    errors_t = recon_errors.float().transpose(0, 1)  # [batch, n_steps]
+
+    weights = torch.zeros_like(errors_t)  # [batch, n_steps]
+
+    # Success: softmax(e_i / T) — high error = high weight
+    if success_mask.any():
+        success_logits = errors_t[success_mask] / (temperature + eps)
+        weights[success_mask] = F.softmax(success_logits, dim=-1)
+
+    # Failure: softmax(-e_i / T) — low error (high confidence) = high weight
+    if failure_mask.any():
+        failure_logits = -errors_t[failure_mask] / (temperature + eps)
+        weights[failure_mask] = F.softmax(failure_logits, dim=-1)
+
+    # Optional weight clipping and re-normalization
+    if w_min > 0.0 or w_max < 1.0:
+        weights = weights.clamp(min=w_min, max=w_max)
+        # Re-normalize so weights sum to 1 per episode
+        weight_sums = weights.sum(dim=-1, keepdim=True).clamp(min=eps)
+        weights = weights / weight_sums
+
+    # Scale weights so that mean weight = 1 (instead of 1/n_steps)
+    # This makes the loss magnitude independent of episode length
+    weights = weights * n_steps
+
+    # Transpose back to [n_steps, batch]
+    weights = weights.transpose(0, 1)
+
+    return weights, labels

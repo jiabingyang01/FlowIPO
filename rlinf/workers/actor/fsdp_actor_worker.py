@@ -82,7 +82,8 @@ from rlinf.utils.utils import (
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
-from rlinf.algorithms.credit_assignment import compute_flow_ipo_weights
+from rlinf.algorithms.credit_assignment import compute_flow_ipo_weights, compute_flow_sar_weights
+from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.workers.rollout.utils import RankMapper
 
 
@@ -1019,96 +1020,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         self.setup_model_and_optimizer()
 
-        # FlowIPO: initialize EMA reference model weights on CPU
+        # FlowIPO: config only (EMA ref model lives on rollout worker)
         self._is_flow_ipo = self.cfg.algorithm.loss_type == "flow_ipo"
         if self._is_flow_ipo:
-            self._init_flow_ipo_ref_model()
+            self._flow_ipo_cfg = {
+                "alpha": self.cfg.algorithm.get("flow_ipo_alpha", 2.0),
+            }
+
+        # FlowSAR: config only (EMA ref model + self-annotation on rollout worker)
+        self._is_flow_sar = self.cfg.algorithm.loss_type == "flow_sar"
+        if self._is_flow_sar:
+            self._flow_sar_cfg = {
+                "temperature": self.cfg.algorithm.get("flow_sar_temperature", 0.5),
+                "beta": self.cfg.algorithm.get("flow_sar_beta", 1.0),
+                "energy_type": self.cfg.algorithm.get("flow_sar_energy_type", "mse"),
+                "loss_variant": self.cfg.algorithm.get("flow_sar_loss_variant", "mse_branch"),
+                "kl_coeff": self.cfg.algorithm.get("flow_sar_kl_coeff", 0.5),
+                "w_min": self.cfg.algorithm.get("flow_sar_w_min", 0.0),
+                "w_max": self.cfg.algorithm.get("flow_sar_w_max", 1.0),
+            }
 
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
-
-    # ==================== FlowIPO Methods ====================
-
-    def _init_flow_ipo_ref_model(self) -> None:
-        """Initialize EMA reference model weights on CPU for FlowIPO."""
-        import copy
-        self._ref_weights_cpu = {
-            k: v.clone().cpu()
-            for k, v in self.get_model_state_dict(
-                cpu_offload=True, full_state_dict=True
-            ).items()
-        }
-        # Buffer for temporarily offloading current model weights during swap
-        self._ref_swap_buffer = None
-        self._flow_ipo_cfg = {
-            "alpha": self.cfg.algorithm.get("flow_ipo_alpha", 2.0),
-            "beta_ref": self.cfg.algorithm.get("flow_ipo_beta_ref", 0.995),
-            "t_min": self.cfg.algorithm.get("flow_ipo_t_min", 0.2),
-            "t_max": self.cfg.algorithm.get("flow_ipo_t_max", 0.8),
-        }
-
-    def _ema_update_ref_model(self) -> None:
-        """EMA update: θ_ref ← β * θ_ref + (1 - β) * θ"""
-        beta = self._flow_ipo_cfg["beta_ref"]
-        current_weights = self.get_model_state_dict(
-            cpu_offload=True, full_state_dict=True
-        )
-        for key in self._ref_weights_cpu:
-            self._ref_weights_cpu[key] = (
-                beta * self._ref_weights_cpu[key]
-                + (1 - beta) * current_weights[key].cpu()
-            )
-
-    @torch.no_grad()
-    def _compute_reference_actions(
-        self, forward_inputs: dict, initial_noise: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Generate reference actions from the EMA reference model using the
-        same initial noise as rollout. Uses cpu_weight_swap to temporarily
-        load reference weights onto GPU.
-
-        Args:
-            forward_inputs: Observation data dict.
-            initial_noise: Initial noise ε₀ from rollout, shape [batch, horizon, action_dim].
-
-        Returns:
-            ref_actions: Reference actions, same shape as initial_noise.
-        """
-        from openpi.models import model as _model
-
-        self.model.eval()
-        with cpu_weight_swap(self.model, self._ref_weights_cpu, self._ref_swap_buffer):
-            observation = self.model.input_transform(forward_inputs, transpose=False)
-            observation = _model.Observation.from_dict(observation)
-            # Use ODE sampling (eval mode) with the same initial noise
-            outputs = self.model.sample_actions(
-                observation, noise=initial_noise, mode="eval", compute_values=False
-            )
-        self.model.train()
-        return outputs["actions"]
-
-    @torch.no_grad()
-    def _compute_reference_velocity(
-        self, forward_inputs: dict, x_t: torch.Tensor, timestep: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute reference velocity v_ref(x_t, t, s) using the EMA reference model.
-        Single forward pass, no gradient.
-
-        Args:
-            forward_inputs: Observation data dict.
-            x_t: Noisy actions, shape [batch, horizon, action_dim].
-            timestep: Flow matching time, shape [batch, 1].
-
-        Returns:
-            v_ref: Reference velocity prediction.
-        """
-        with cpu_weight_swap(self.model, self._ref_weights_cpu, self._ref_swap_buffer):
-            v_ref = self.model.forward_velocity(forward_inputs, x_t, timestep)
-        return v_ref
 
     # ==================== End FlowIPO Methods ====================
 
@@ -1249,6 +1184,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         if self._is_flow_ipo:
             return self._compute_flow_ipo_credit_assignment()
+        if self._is_flow_sar:
+            return self._compute_flow_sar_credit_assignment()
 
         kwargs = {
             "task_type": self.cfg.runner.task_type,
@@ -1277,48 +1214,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     def _compute_flow_ipo_credit_assignment(self) -> dict:
         """
-        FlowIPO credit assignment:
-        1. Generate reference actions from EMA model using same initial noise
+        FlowIPO credit assignment (ref_actions pre-computed by rollout worker):
+        1. Read pre-computed reference actions from forward_inputs
         2. Compute per-step policy divergence δ_i
         3. Compute interpolation weights w_i = sigmoid(α * (2R-1) * normalize(δ_i))
         """
         actions = self.rollout_batch["actions"]  # [n_steps, batch, chunk, action_dim]
         rewards = self.rollout_batch["rewards"]  # [n_steps, batch, chunk] or similar
         forward_inputs = self.rollout_batch.get("forward_inputs", {})
-        initial_noise = forward_inputs.get("initial_noise", None)
 
         # Compute episode-level reward: sum across steps and chunks
-        # rewards shape: [n_steps, batch, num_action_chunks]
-        dones = self.rollout_batch.get("dones", None)
         loss_mask = self.rollout_batch.get("loss_mask", None)
         if loss_mask is not None:
             episode_rewards = (rewards * loss_mask).sum(dim=(0, 2))  # [batch]
         else:
             episode_rewards = rewards.sum(dim=(0, 2))  # [batch]
-        # Normalize to [0, 1] for binary interpretation
         episode_rewards = episode_rewards.clamp(0, 1)
 
-        # Generate reference actions using same initial noise
-        if initial_noise is not None:
-            device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
-            n_steps, batch_size = actions.shape[0], actions.shape[1]
-
-            # Compute reference actions step by step
-            ref_actions_list = []
-            for step_idx in range(n_steps):
-                step_forward_inputs = {
-                    k: (v[step_idx].to(device) if torch.is_tensor(v) and v.dim() > 1 else v)
-                    for k, v in forward_inputs.items()
-                    if k != "initial_noise"
-                }
-                step_noise = initial_noise[step_idx].to(device)
-                ref_act = self._compute_reference_actions(
-                    step_forward_inputs, step_noise
-                )
-                ref_actions_list.append(ref_act.cpu())
-            ref_actions = torch.stack(ref_actions_list, dim=0)  # [n_steps, batch, ...]
-        else:
-            # Fallback: if no initial noise stored, use zero-divergence
+        # Reference actions pre-computed by rollout worker (distributed, no ODE here)
+        ref_actions = forward_inputs.get("ref_action", None)
+        if ref_actions is None:
             ref_actions = actions.clone()
 
         # Compute FlowIPO weights
@@ -1331,15 +1246,67 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # Store in rollout_batch for training loop
         self.rollout_batch["flow_ipo_weights"] = flow_ipo_weights
-        # Also need dummy advantages for compatibility with data reshaping
         self.rollout_batch["advantages"] = torch.zeros_like(
             self.rollout_batch["prev_logprobs"]
         )
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
-        # Add FlowIPO-specific metrics
         rollout_metrics["flow_ipo/mean_weight"] = flow_ipo_weights.mean().item()
         rollout_metrics["flow_ipo/episode_reward"] = episode_rewards.mean().item()
+        return rollout_metrics
+
+    def _compute_flow_sar_credit_assignment(self) -> dict:
+        """
+        FlowSAR Phase 3: Credit assignment based on self-annotation reconstruction errors.
+
+        Success trajectories: uncertain-but-correct steps get high weight (softmax(e/T))
+        Failure trajectories: confident-but-wrong steps get high weight (softmax(-e/T))
+        """
+        rewards = self.rollout_batch["rewards"]  # [n_steps, batch, chunk] or similar
+        forward_inputs = self.rollout_batch.get("forward_inputs", {})
+
+        # Compute episode-level reward: sum across steps and chunks
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            episode_rewards = (rewards * loss_mask).sum(dim=(0, 2))  # [batch]
+        else:
+            episode_rewards = rewards.sum(dim=(0, 2))  # [batch]
+        episode_rewards = episode_rewards.clamp(0, 1)
+
+        # Extract pre-computed reconstruction errors from forward_inputs
+        recon_errors = forward_inputs.get("recon_error", None)
+        if recon_errors is None:
+            # Fallback: uniform weights if self-annotation was not computed
+            n_steps = rewards.shape[0]
+            batch_size = rewards.shape[1]
+            recon_errors = torch.ones(n_steps, batch_size)
+
+        # Compute FlowSAR weights and contrastive labels
+        flow_sar_weights, flow_sar_labels = compute_flow_sar_weights(
+            recon_errors=recon_errors,
+            rewards=episode_rewards,
+            temperature=self._flow_sar_cfg["temperature"],
+            w_min=self._flow_sar_cfg["w_min"],
+            w_max=self._flow_sar_cfg["w_max"],
+        )  # weights: [n_steps, batch], labels: [batch]
+
+        # Store in rollout_batch for training loop
+        # flow_sar_weights: already [n_steps, batch]
+        self.rollout_batch["flow_sar_weights"] = flow_sar_weights
+        # flow_sar_labels: [batch] -> expand to [n_steps, batch] for data pipeline compatibility
+        # (each step in same episode gets the same label y_i = 2R - 1)
+        n_steps = rewards.shape[0]
+        self.rollout_batch["flow_sar_labels"] = flow_sar_labels.unsqueeze(0).expand(n_steps, -1)
+        self.rollout_batch["advantages"] = torch.zeros_like(
+            self.rollout_batch["prev_logprobs"]
+        )
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics["flow_sar/mean_weight"] = flow_sar_weights.mean().item()
+        rollout_metrics["flow_sar/weight_std"] = flow_sar_weights.std().item()
+        rollout_metrics["flow_sar/episode_reward"] = episode_rewards.mean().item()
+        rollout_metrics["flow_sar/success_rate"] = (episode_rewards > 0.5).float().mean().item()
+        rollout_metrics["flow_sar/mean_recon_error"] = recon_errors.mean().item()
         return rollout_metrics
 
     @Worker.timer("run_training")
@@ -1424,46 +1391,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     if self._is_flow_ipo:
                         # ============ FlowIPO Training Branch ============
-                        # Retrieve rollout actions and FlowIPO weights (precomputed)
                         actions = batch["actions"]              # [batch, chunk, action_dim]
                         flow_ipo_weights = batch["flow_ipo_weights"]  # [batch]
 
                         action_chunk = self.cfg.actor.model.get("action_chunk", 5)
                         action_dim = self.cfg.actor.model.get("action_dim", 7)
-                        action_horizon = actions.shape[1]  # full action_horizon
-
-                        # Step 1: Sample t ~ U[t_min, t_max], ε ~ N(0, I)
                         bsz = actions.shape[0]
-                        device = actions.device
-                        t_min = self._flow_ipo_cfg["t_min"]
-                        t_max = self._flow_ipo_cfg["t_max"]
-                        t = torch.rand(bsz, 1, 1, device=device) * (t_max - t_min) + t_min
-                        epsilon = torch.randn_like(actions)
 
-                        # Step 2: Construct x_t = (1-t) * a_i + t * ε
+                        # Read pre-computed t, ε, v_ref from rollout worker
+                        t = forward_inputs["flow_t"]       # [batch, 1, 1]
+                        epsilon = forward_inputs["flow_epsilon"]  # [batch, horizon, dim]
+                        v_ref = forward_inputs["ref_v"]     # [batch, horizon, dim]
+
+                        # Recompute x_t and u_i from stored t, ε
                         x_t = (1 - t) * actions + t * epsilon
-
-                        # Step 3: Current velocity target u_i = ε - a_i (π0 convention: noise - actions)
                         u_i = epsilon - actions
 
-                        # Step 4: Reference velocity v_ref(x_t, t, s_i) — no grad
-                        timestep = t.squeeze(-1)  # [batch, 1]
-                        with torch.no_grad():
-                            v_ref = self._compute_reference_velocity(
-                                forward_inputs, x_t, timestep
-                            )
-
-                        # Step 5: Interpolated target ṽ_i = w_i * u_i + (1 - w_i) * v_ref
-                        # Expand w_i for broadcasting: [batch] -> [batch, 1, 1]
+                        # Interpolated target ṽ_i = w_i * u_i + (1 - w_i) * v_ref
                         w = flow_ipo_weights
                         while w.dim() < u_i.dim():
                             w = w.unsqueeze(-1)
                         interpolated_target = (w * u_i + (1 - w) * v_ref).detach()
 
-                        # Step 6: Model forward v_θ(x_t, t, s_i) — with grad
+                        # Model forward v_θ(x_t, t, s_i) — with grad (via FSDP forward())
+                        timestep = t.reshape(bsz)
                         with self.amp_context:
-                            v_theta = self.model.forward_velocity(
-                                forward_inputs, x_t, timestep
+                            v_theta = self.model(
+                                forward_type=ForwardType.VELOCITY,
+                                forward_inputs=forward_inputs,
+                                x_t=x_t, timestep=timestep,
                             )
 
                         # Step 7: Compute FlowIPO loss
@@ -1479,6 +1435,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         }
                         loss, metrics_data = policy_loss(**loss_kwargs)
                         # ============ End FlowIPO Branch ============
+                    elif self._is_flow_sar:
+                        # ============ FlowSAR Training Branch ============
+                        actions = batch["actions"]  # [batch, chunk, action_dim]
+                        flow_sar_weights = batch["flow_sar_weights"]  # [batch]
+                        flow_sar_labels = batch["flow_sar_labels"]    # [batch]
+
+                        action_chunk = self.cfg.actor.model.get("action_chunk", 5)
+                        action_dim = self.cfg.actor.model.get("action_dim", 7)
+                        bsz = actions.shape[0]
+
+                        # Read pre-computed t, ε, v_old from rollout worker
+                        t = forward_inputs["flow_t"]         # [batch, 1, 1]
+                        epsilon = forward_inputs["flow_epsilon"]  # [batch, horizon, dim]
+                        v_old = forward_inputs["v_old"]       # [batch, horizon, dim]
+
+                        # Recompute x_t and u_i from stored t, ε
+                        x_t = (1 - t) * actions + t * epsilon
+                        u_i = epsilon - actions  # flow matching target velocity
+
+                        # Model forward v_θ(x_t, t, s_i) — with grad (via FSDP forward())
+                        timestep = t.reshape(bsz)
+                        with self.amp_context:
+                            v_theta = self.model(
+                                forward_type=ForwardType.VELOCITY,
+                                forward_inputs=forward_inputs,
+                                x_t=x_t, timestep=timestep,
+                            )
+
+                        # Crop to action_chunk portion for loss
+                        v_theta_chunk = v_theta[:, :action_chunk, :action_dim]
+                        v_old_chunk = v_old[:, :action_chunk, :action_dim].detach()
+                        u_i_chunk = u_i[:, :action_chunk, :action_dim]
+
+                        # Compute FlowSAR loss
+                        loss_kwargs = {
+                            "loss_type": "flow_sar",
+                            "v_theta": v_theta_chunk,
+                            "v_old": v_old_chunk,
+                            "u_target": u_i_chunk,
+                            "weights": flow_sar_weights,
+                            "labels": flow_sar_labels,
+                            "beta": self._flow_sar_cfg["beta"],
+                            "energy_type": self._flow_sar_cfg["energy_type"],
+                            "loss_variant": self._flow_sar_cfg["loss_variant"],
+                            "kl_coeff": self._flow_sar_cfg["kl_coeff"],
+                            "flow_t": t,
+                            "loss_mask": loss_mask,
+                        }
+                        loss, metrics_data = policy_loss(**loss_kwargs)
+                        # ============ End FlowSAR Branch ============
                     else:
                         # ============ Original PPO/GRPO Branch ============
                         advantages = batch["advantages"]
@@ -1580,10 +1586,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
-        # FlowIPO: EMA update reference model after each training iteration
-        if self._is_flow_ipo:
-            self._ema_update_ref_model()
-
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()

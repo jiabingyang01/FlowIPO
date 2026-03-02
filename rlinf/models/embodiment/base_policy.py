@@ -23,6 +23,7 @@ class ForwardType(Enum):
     SAC_Q = "sac_q"
     CROSSQ = "crossq"
     CROSSQ_Q = "crossq_q"
+    VELOCITY = "velocity"  # FlowIPO: velocity prediction through FSDP forward()
 
 
 class BasePolicy(ABC):

@@ -31,7 +31,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.utils import get_model_weights_id
+from rlinf.utils.utils import cpu_weight_swap, get_model_weights_id
 
 
 class MultiStepRolloutWorker(Worker):
@@ -72,6 +72,28 @@ class MultiStepRolloutWorker(Worker):
             self.total_num_eval_envs // self._world_size // self.num_pipeline_stages
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
+
+        # FlowIPO / FlowSAR: EMA reference model for computation on rollout worker
+        _loss_type = cfg.algorithm.get("loss_type", "")
+        self._is_flow_ipo = _loss_type == "flow_ipo"
+        self._is_flow_sar = _loss_type == "flow_sar"
+        self._needs_ema_ref = self._is_flow_ipo or self._is_flow_sar
+        if self._needs_ema_ref:
+            self._ref_weights_cpu = None
+            self._ref_swap_buffer = None
+        if self._is_flow_ipo:
+            self._flow_ipo_beta = cfg.algorithm.get("flow_ipo_beta_ref", 0.995)
+        if self._is_flow_sar:
+            self._flow_sar_ema_beta = cfg.algorithm.get("flow_sar_ema_beta", 0.995)
+            # DiffusionNFT-style dynamic EMA schedule: η_i = min(eta_rate * i, eta_max)
+            # "fixed" = use flow_sar_ema_beta constantly
+            # "linear" = DiffusionNFT-style: β_i = min(eta_rate * i, eta_max)
+            self._flow_sar_ema_schedule = cfg.algorithm.get("flow_sar_ema_schedule", "fixed")
+            self._flow_sar_ema_eta_rate = cfg.algorithm.get("flow_sar_ema_eta_rate", 0.001)
+            self._flow_sar_ema_eta_max = cfg.algorithm.get("flow_sar_ema_eta_max", 0.5)
+            self._flow_sar_tau_mid = cfg.algorithm.get("flow_sar_tau_mid", 0.5)
+            self._flow_sar_t_min = cfg.algorithm.get("flow_sar_t_min", 0.2)
+            self._flow_sar_t_max = cfg.algorithm.get("flow_sar_t_max", 0.8)
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -220,6 +242,30 @@ class MultiStepRolloutWorker(Worker):
             options=self._sync_weight_comm_options,
         ).async_wait()
 
+        # FlowIPO / FlowSAR: maintain EMA reference weights on rollout worker
+        if self._needs_ema_ref:
+            if self._is_flow_ipo:
+                beta = self._flow_ipo_beta
+            elif self._is_flow_sar and self._flow_sar_ema_schedule == "linear":
+                # DiffusionNFT-style dynamic EMA: β_i = min(eta_rate * i, eta_max)
+                # Early iterations: β ≈ 0 → aggressive update (ref ≈ θ_new)
+                # Later iterations: β → eta_max → conservative update
+                beta = min(
+                    self._flow_sar_ema_eta_rate * self.count_update,
+                    self._flow_sar_ema_eta_max,
+                )
+            else:
+                beta = self._flow_sar_ema_beta
+            if self._ref_weights_cpu is None:
+                self._ref_weights_cpu = {
+                    k: v.clone().cpu() for k, v in param_state_dict.items()
+                }
+            else:
+                for k in self._ref_weights_cpu:
+                    self._ref_weights_cpu[k].mul_(beta).add_(
+                        param_state_dict[k].cpu(), alpha=1 - beta
+                    )
+
         self.hf_model.load_state_dict(param_state_dict)
         self.model_weights_id = (
             str(get_model_weights_id(self.hf_model)) + f"_{self.count_update}"
@@ -332,6 +378,130 @@ class MultiStepRolloutWorker(Worker):
                 )
                 self.rollout_results[stage_id].append_transitions(curr_obs, next_obs)
 
+    @torch.no_grad()
+    def _compute_reference_actions(self, rollout_result: EmbodiedRolloutResult):
+        """
+        FlowIPO: compute ref_actions and ref_velocity using EMA model on rollout worker.
+        Uses cpu_weight_swap on the non-FSDP rollout model.
+        Stores ref_action, ref_v, flow_t, flow_epsilon in forward_inputs.
+        """
+        from openpi.models import model as _model
+
+        t_min = self.cfg.algorithm.get("flow_ipo_t_min", 0.2)
+        t_max = self.cfg.algorithm.get("flow_ipo_t_max", 0.8)
+
+        with cpu_weight_swap(self.hf_model, self._ref_weights_cpu, self._ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                noise = fi.get("initial_noise", None)
+                if noise is None:
+                    continue
+                # Reconstruct observation from cached "~" keys
+                obs_dict = {}
+                for k, v in fi.items():
+                    if not k.startswith("~"):
+                        continue
+                    parts = k[1:].split("~", 1)
+                    val = v.to(self.device) if torch.is_tensor(v) else v
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                # 1) Reference actions via ODE sampling
+                outputs = self.hf_model.sample_actions(
+                    observation, noise=noise.to(self.device),
+                    mode="eval", compute_values=False,
+                )
+                fi["ref_action"] = outputs["actions"].cpu()
+
+                # 2) Pre-sample t, ε and compute reference velocity
+                actions = fi["action"].to(self.device)
+                bsz = actions.shape[0]
+                t = torch.rand(bsz, 1, 1, device=self.device) * (t_max - t_min) + t_min
+                epsilon = torch.randn_like(actions)
+                x_t = (1 - t) * actions + t * epsilon
+                v_ref = self.hf_model.forward_velocity(
+                    None, x_t, t.reshape(bsz), observation=observation,
+                )
+                fi["ref_v"] = v_ref.cpu()
+                fi["flow_t"] = t.cpu()
+                fi["flow_epsilon"] = epsilon.cpu()
+
+    @torch.no_grad()
+    def _compute_self_annotation(self, rollout_result: EmbodiedRolloutResult):
+        """
+        FlowSAR Phase 2: Self-Annotation + pre-compute training data.
+
+        For each rollout step:
+        1. Self-Annotation: compute reconstruction error e_i (policy confidence proxy)
+           - Forward noise: x_τ = τ_mid * a_i + (1 - τ_mid) * ε
+           - One-step reconstruction: â_i = x_τ + v_θ_old(x_τ, τ_mid, s_i) * (1 - τ_mid)
+           - Error: e_i = ||a_i - â_i||²
+
+        2. Pre-compute training data: sample (t, ε), compute v_old
+           - t ~ U[t_min, t_max], ε ~ N(0, I)
+           - x_t = (1-t) * a_i + t * ε
+           - v_old = v_θ_old(x_t, t, s_i)
+
+        Stores: recon_error, flow_t, flow_epsilon, v_old in forward_inputs.
+        """
+        from openpi.models import model as _model
+
+        tau_mid = self._flow_sar_tau_mid
+        t_min = self._flow_sar_t_min
+        t_max = self._flow_sar_t_max
+
+        with cpu_weight_swap(self.hf_model, self._ref_weights_cpu, self._ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                actions = fi.get("action", None)
+                if actions is None:
+                    continue
+
+                # Reconstruct observation from cached "~" keys (reuse FlowIPO pattern)
+                obs_dict = {}
+                for k, v in fi.items():
+                    if not k.startswith("~"):
+                        continue
+                    parts = k[1:].split("~", 1)
+                    val = v.to(self.device) if torch.is_tensor(v) else v
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                actions_gpu = actions.to(self.device)
+                bsz = actions_gpu.shape[0]
+
+                # ===== Phase 2a: Self-Annotation (reconstruction error) =====
+                # Model convention: t=0 → clean, t=1 → noise
+                # x_t = (1-t)*a + t*ε,  velocity v = ε - a
+                eps_recon = torch.randn_like(actions_gpu)
+                x_tau = (1 - tau_mid) * actions_gpu + tau_mid * eps_recon
+                t_recon = torch.full((bsz,), tau_mid, device=self.device)
+
+                v_pred = self.hf_model.forward_velocity(
+                    None, x_tau, t_recon, observation=observation,
+                )
+                # Backward integration to t=0 (clean): a_hat = x_tau - v * tau_mid
+                a_hat = x_tau - v_pred * tau_mid
+                # Per-sample reconstruction error (sum over chunk & action_dim)
+                recon_error = (actions_gpu - a_hat).pow(2).sum(dim=(-2, -1))  # [batch]
+                fi["recon_error"] = recon_error.cpu()
+
+                # ===== Phase 2b: Pre-compute training data (t, ε, v_old) =====
+                t = torch.rand(bsz, 1, 1, device=self.device) * (t_max - t_min) + t_min
+                epsilon = torch.randn_like(actions_gpu)
+                x_t = (1 - t) * actions_gpu + t * epsilon
+
+                v_old = self.hf_model.forward_velocity(
+                    None, x_t, t.reshape(bsz), observation=observation,
+                )
+                fi["v_old"] = v_old.cpu()
+                fi["flow_t"] = t.cpu()
+                fi["flow_epsilon"] = epsilon.cpu()
+
     async def generate(
         self, input_channel: Channel, output_channel: Channel, actor_channel: Channel
     ):
@@ -353,6 +523,14 @@ class MultiStepRolloutWorker(Worker):
             disable=(self._rank != 0),
         ):
             await self.generate_one_epoch(input_channel, output_channel)
+
+        # FlowIPO / FlowSAR: compute additional data on rollout worker (non-FSDP)
+        if self._needs_ema_ref and self._ref_weights_cpu is not None:
+            for stage_id in range(self.num_pipeline_stages):
+                if self._is_flow_ipo:
+                    self._compute_reference_actions(self.rollout_results[stage_id])
+                elif self._is_flow_sar:
+                    self._compute_self_annotation(self.rollout_results[stage_id])
 
         for stage_id in range(self.num_pipeline_stages):
             await self.send_rollout_trajectories(

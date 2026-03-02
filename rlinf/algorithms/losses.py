@@ -15,6 +15,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 
 from rlinf.algorithms.registry import register_policy_loss
 from rlinf.algorithms.utils import huber_loss
@@ -318,4 +319,113 @@ def compute_flow_ipo_loss(
         "actor/flow_ipo_loss": loss.detach().item(),
         "actor/velocity_mse": mse.detach().mean().item(),
     }
+    return loss, metrics_data
+
+
+@register_policy_loss("flow_sar")
+def compute_flow_sar_loss(
+    v_theta: torch.Tensor,
+    v_old: torch.Tensor,
+    u_target: torch.Tensor,
+    weights: torch.Tensor,
+    labels: torch.Tensor,
+    beta: float = 1.0,
+    energy_type: str = "mse",
+    loss_variant: str = "mse_branch",
+    kl_coeff: float = 0.5,
+    flow_t: Optional[torch.Tensor] = None,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute FlowSAR loss with mirror construction.
+
+    v⁺ = (1 - β) * v_old + β * v_θ      (positive branch: toward current policy)
+    v⁻ = (1 + β) * v_old - β * v_θ      (negative branch: away from current policy)
+
+    Energy modes (energy_type):
+      - "mse" (ODE): E = ||v - u||²  (velocity-space MSE, all timesteps equal)
+      - "sde" (Flow-SDE Mahalanobis): E = ||v - u||² / (2t)
+        Derived from Flow-SDE transition kernel variance σ_t² ≈ 2tδ.
+
+    Loss variants (loss_variant):
+      - "mse_branch" (DiffusionNFT-style): L = w_i * [R_i * E⁺ + (1 - R_i) * E⁻]
+        Reward-conditioned branch selection. Bounded by mirror construction.
+      - "softplus_kl" (π-StepNFT-style): L = w_i * softplus(½ y (E⁺ - E⁻)) + kl_coeff * ||v_θ - v_old||²
+        Contrastive softplus ranking + trust region KL penalty.
+
+    Args:
+        v_theta: Current model velocity prediction, shape [batch, chunk, action_dim].
+        v_old: Reference (EMA) velocity prediction (detached), same shape.
+        u_target: Flow matching target velocity (ε - a), same shape.
+        weights: Per-step credit assignment weights, shape [batch].
+        labels: Contrastive labels y_i = 2R-1 ∈ {-1, +1}, shape [batch].
+        beta: Trust region parameter for mirror construction.
+        energy_type: "mse" for ODE velocity MSE, "sde" for Flow-SDE Mahalanobis.
+        loss_variant: "mse_branch" for DiffusionNFT-style, "softplus_kl" for π-StepNFT-style.
+        kl_coeff: KL penalty coefficient (only used when loss_variant="softplus_kl").
+        flow_t: Flow matching timestep per sample, shape [batch]. Required for "sde".
+        loss_mask: Optional mask for valid entries.
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (flow_sar_loss, metrics_dict)
+    """
+    # Mirror velocity construction
+    v_pos = (1 - beta) * v_old + beta * v_theta           # positive branch
+    v_neg = (1 + beta) * v_old - beta * v_theta           # negative branch
+
+    # Branch errors: MSE against flow matching target u_i
+    # Mean over chunk and action_dim dimensions -> [batch]
+    E_pos = (v_pos - u_target).pow(2).mean(dim=(-2, -1))  # [batch]
+    E_neg = (v_neg - u_target).pow(2).mean(dim=(-2, -1))  # [batch]
+
+    # SDE mode: apply Mahalanobis scaling from Flow-SDE transition kernel
+    # σ_t² ≈ 2tδ → E_SDE = δ/(2t) * ||v-u||² → scale by 1/(2t)
+    if energy_type == "sde" and flow_t is not None:
+        t_flat = flow_t.reshape(-1)  # [batch]
+        sde_scale = 1.0 / (2.0 * t_flat).clamp(min=1e-3)  # [batch]
+        E_pos = E_pos * sde_scale
+        E_neg = E_neg * sde_scale
+
+    if loss_variant == "softplus_kl":
+        # ---- π-StepNFT-style: softplus contrastive + trust region ----
+        # Contrastive ranking loss with softplus
+        # y_i = +1 (success): minimize E⁺ - E⁻ (positive branch should be closer)
+        # y_i = -1 (failure): minimize -(E⁺ - E⁻) (push away from current policy)
+        margin = 0.5 * labels * (E_pos - E_neg)
+        contrastive = F.softplus(margin)  # [batch]
+
+        # Trust region KL penalty: ||v_θ - v_old||² (velocity-space divergence)
+        kl_penalty = (v_theta - v_old).pow(2).mean(dim=(-2, -1))  # [batch]
+
+        per_sample_loss = weights * contrastive + kl_coeff * kl_penalty  # [batch]
+    else:
+        # ---- DiffusionNFT-style: reward-conditioned branch selection (default) ----
+        # labels: y_i = 2R-1, so R_i = (labels + 1) / 2
+        R = (labels + 1.0) / 2.0  # [batch], 0.0 or 1.0
+        per_sample_loss = weights * (R * E_pos + (1.0 - R) * E_neg)  # [batch]
+
+    # Apply loss mask if provided
+    if loss_mask is not None:
+        if loss_mask.dim() > 1:
+            loss_mask = loss_mask.reshape(loss_mask.shape[0], -1).any(dim=-1)
+        loss_mask = loss_mask.float()
+        loss = (per_sample_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+    else:
+        loss = per_sample_loss.mean()
+
+    metrics_data = {
+        "actor/flow_sar_loss": loss.detach().item(),
+        "actor/flow_sar_E_pos": E_pos.detach().mean().item(),
+        "actor/flow_sar_E_neg": E_neg.detach().mean().item(),
+        "actor/flow_sar_weight_mean": weights.detach().mean().item(),
+        "actor/flow_sar_energy_type": 1.0 if energy_type == "sde" else 0.0,
+        "actor/flow_sar_loss_variant": 1.0 if loss_variant == "softplus_kl" else 0.0,
+    }
+    if loss_variant == "softplus_kl":
+        metrics_data["actor/flow_sar_contrastive"] = contrastive.detach().mean().item()
+        metrics_data["actor/flow_sar_kl_penalty"] = kl_penalty.detach().mean().item()
+    else:
+        R = (labels + 1.0) / 2.0
+        metrics_data["actor/flow_sar_success_ratio"] = R.detach().mean().item()
     return loss, metrics_data

@@ -12,8 +12,9 @@
 | `rlinf/algorithms/losses.py` | 修改 | 新增 `@register_policy_loss("flow_ipo")` 损失函数 |
 | `rlinf/algorithms/registry.py` | 修改 | `policy_loss()` 中为 flow_ipo 跳过 logprob 预处理 |
 | `rlinf/algorithms/__init__.py` | 修改 | 注册 `credit_assignment` 模块 |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 修改 | 存储 initial_noise；新增 `forward_velocity()` 方法 |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | 修改 | 存储 initial_noise 和 action；新增 `forward_velocity()` 方法 |
 | `rlinf/workers/actor/fsdp_actor_worker.py` | 修改 | **最大改动**：EMA 参考模型、信用分配、FlowIPO 训练分支 |
+| `rlinf/data/embodied_io_struct.py` | 修改 | 修复 `convert_trajectories_to_batch()` 中变量作用域 bug |
 | `examples/embodiment/config/libero_object_flowipo_openpi.yaml` | **新建** | FlowIPO 专用 Hydra 配置文件 |
 
 **一键启用方式**：将训练配置从 `libero_object_ppo_openpi.yaml` 换成 `libero_object_flowipo_openpi.yaml`，核心开关为 `loss_type: flow_ipo`。
@@ -122,18 +123,42 @@ from . import advantages, credit_assignment, losses, registry  # noqa: F401
 
 ### 2.5 `rlinf/models/embodiment/openpi/openpi_action_model.py`（修改）
 
-#### 改动 1：存储 initial_noise
+#### 改动 1：存储 initial_noise 和 action
 
-在 `predict_action_batch()` 中，将 ODE 采样的初始噪声 $\varepsilon_0$ 存入 `forward_inputs`：
+在 `predict_action_batch()` 中，将 ODE 采样的初始噪声 $\varepsilon_0$ 和去噪后的 raw action 存入 `forward_inputs`：
 
 ```python
 # 在 forward_inputs 字典中新增
-"initial_noise": outputs["chains"][:, 0]   # 保存初始噪声用于 FlowIPO 参考动作生成
+"initial_noise": outputs["chains"][:, 0],  # 保存初始噪声用于 FlowIPO 参考动作生成
+"action": outputs["actions"],              # 保存去噪后的 raw action 用于 FlowIPO 信用分配
 ```
 
-**用途：** FlowIPO 需要参考策略从**相同的初始噪声**出发生成动作，才能让 $\delta_i$ 纯粹反映策略差异而非噪声差异。
+**用途：**
+- `initial_noise`：FlowIPO 需要参考策略从**相同的初始噪声**出发生成动作，才能让 $\delta_i$ 纯粹反映策略差异而非噪声差异。
+- `action`：FlowIPO 信用分配阶段需要从 `rollout_batch["actions"]` 获取当前策略的动作来计算 $\delta_i = \|a_i - a_i^{ref}\|_2$。原始代码中 `forward_inputs` 未包含 `"action"` key，导致 rollout worker 通过 `result["forward_inputs"].get("action", None)` 得到 `None`，`Trajectory.actions` 不被赋值，最终 `rollout_batch` 缺少 `"actions"` 字段。PPO/GRPO 不直接访问此字段（它们通过 `forward_inputs["chains"]` 重算 logprob），所以该问题仅在 FlowIPO 路径暴露。
 
-#### 改动 2：新增 `forward_velocity()` 方法
+#### 改动 2：缓存已处理的观测数据
+
+在 `predict_action_batch()` 中，`input_transform` 输出后、`precision_processor` 调用前，将已处理的观测数据以 `"~"` 前缀扁平化存入 `forward_inputs`：
+
+```python
+# 缓存 processed obs（CPU tensors），避免参考动作计算时重跑 input_transform
+_cached_proc = {}
+for _k, _v in processed_obs.items():
+    if isinstance(_v, dict):  # e.g., "image" → {"base_0_rgb": tensor}
+        for _sk, _sv in _v.items():
+            _cached_proc[f"~{_k}~{_sk}"] = _sv
+    elif torch.is_tensor(_v):
+        _cached_proc[f"~{_k}"] = _v
+forward_inputs.update(_cached_proc)
+```
+
+**设计要点：**
+- `"~"` 前缀不含 `"/"`，`input_transform` 的 key 过滤（`"/" in key`）不会误选这些 key
+- 所有值均为 tensor，兼容 `stack_list_of_dict_tensor`、`convert_trajectories_to_batch`、`process_nested_dict_for_adv`
+- `_compute_reference_actions_batch` 通过 `"~"` key 重建 `{"image": {...}, "state": ...}` dict，直接调用 `Observation.from_dict`，跳过 `input_transform` 的逐样本 Python 循环
+
+#### 改动 3：新增 `forward_velocity()` 方法
 
 ```python
 def forward_velocity(self, forward_inputs, x_t, timestep) -> torch.Tensor:
@@ -180,10 +205,12 @@ if self._is_flow_ipo:
 
 #### 2.6.3 参考策略推理
 
-**`_compute_reference_actions(forward_inputs, initial_noise)`：**
-- 使用 `cpu_weight_swap` 临时将参考权重加载到 GPU
-- 用参考模型从相同 initial_noise 出发 ODE 采样得到参考动作
-- 返回后自动恢复当前模型权重
+**`_compute_reference_actions_batch(forward_inputs, initial_noise, max_chunk_size)`：**
+- 将 `[n_steps, batch, ...]` 展平为 `[n_steps * batch, ...]` mega-batch，分 chunk 处理
+- **性能关键**：利用 rollout 阶段缓存的已处理观测数据（`"~"` 前缀 key），直接构造 `Observation` 对象，**完全跳过 `input_transform` 的逐样本 Python 循环**（3072+ 次迭代 → 0 次）
+- 缓存命中路径：从 `"~"` key 重建 `{"image": {...}, "state": ...}` dict → `Observation.from_dict` → `sample_actions`（ODE 推理）
+- 缓存未命中路径（fallback）：`input_transform` → `precision_processor` → `Observation.from_dict` → `sample_actions`
+- 调用方通过 `cpu_weight_swap` 管理权重交换（仅一次 swap，而非逐步 swap）
 
 **`_compute_reference_velocity(forward_inputs, x_t, timestep)`：**
 - 使用 `cpu_weight_swap` 加载参考权重
@@ -196,7 +223,7 @@ if self._is_flow_ipo:
 
 1. 提取数据：actions, rewards, forward_inputs, initial_noise
 2. 计算 episode 级奖励：对步骤和 chunk 维度求和，clamp 到 [0, 1]
-3. 逐步生成参考动作（使用相同 initial_noise）
+3. **单次** `cpu_weight_swap` 加载参考权重，循环内逐步生成参考动作（使用相同 initial_noise）。权重交换必须在循环外执行，否则 n_steps × 2 次 FSDP `load_state_dict` 会导致训练卡死
 4. 调用 `compute_flow_ipo_weights()` 得到 $w_i$
 5. 存入 `rollout_batch["flow_ipo_weights"]`，并填充 dummy advantages（兼容数据 reshape）
 
@@ -400,3 +427,7 @@ python train.py --config-name=libero_object_flowipo_openpi \
 4. **dummy advantages 兼容**：FlowIPO 不需要 advantages，但数据 reshape 管线假设 advantages 字段存在，因此填充全零 tensor 保持兼容。
 
 5. **无 Critic**：FlowIPO 不需要 value head，`add_value_head: False`，减少模型参数和显存占用。
+
+6. **forward_inputs 必须包含 `"action"` key**：`rollout_batch["actions"]` 的来源链路为：`forward_inputs["action"]` → `ChunkStepResult.actions` → `Trajectory.actions` → `rollout_batch["actions"]`。原始 RLinf 代码中 `forward_inputs` 不含 `"action"`（PPO/GRPO 不需要直接访问 actions，而是通过 `chains` 重算 logprob），导致 FlowIPO 信用分配阶段 `KeyError: 'actions'`。修复：在 `predict_action_batch()` 的 `forward_inputs` 中添加 `"action": outputs["actions"]`。
+
+7. **`convert_trajectories_to_batch()` 变量作用域修复**：原始代码在遍历 dataclass fields 时使用了前一个 for 循环泄漏的 `traj` 变量（指向 `trajectories[-1]`），应使用 `trajectories[0]` 进行类型检查。该 bug 在 PPO 中不会触发（因为所有 trajectory 的 actions 要么全为 tensor，要么全为 None），但在边界情况下可能导致字段丢失。

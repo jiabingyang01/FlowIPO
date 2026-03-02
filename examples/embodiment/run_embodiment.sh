@@ -35,7 +35,20 @@ export ROBOT_PLATFORM
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
+# Extract experiment_name from YAML config; fall back to CONFIG_NAME if not found
+YAML_FILE="${EMBODIED_PATH}/config/${CONFIG_NAME}.yaml"
+if [ -f "${YAML_FILE}" ]; then
+    EXP_NAME=$(python -c "
+import yaml, sys
+with open('${YAML_FILE}') as f:
+    cfg = yaml.safe_load(f)
+exp = cfg.get('runner', {}).get('logger', {}).get('experiment_name', '')
+print(exp if exp else '${CONFIG_NAME}')
+" 2>/dev/null || echo "${CONFIG_NAME}")
+else
+    EXP_NAME="${CONFIG_NAME}"
+fi
+LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${EXP_NAME}"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
 CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
