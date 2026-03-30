@@ -17,6 +17,7 @@ lora_rank: 32
 use_proprio: True
 num_steps: 4
 add_value_head: False
+add_state_flow_net: False
 
 # openpi specific parameters
 openpi:
@@ -29,4 +30,5 @@ openpi:
   action_env_dim: ${actor.model.action_dim}
   noise_method: "flow_sde"
   add_value_head: ${actor.model.add_value_head}
+  add_state_flow_net: ${actor.model.add_state_flow_net}
   detach_critic_input: False

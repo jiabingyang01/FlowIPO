@@ -1,5 +1,8 @@
-# FlowSAR quickstart configuration for LIBERO Object tasks with OpenPi (π0)
-# Based on libero_object_flowipo_openpi_quickstart.yaml, adapted for FlowSAR.
+# FlowAWM quickstart configuration for LIBERO Object tasks with OpenPi (π0)
+# AWM-VLA = Advantage Weighted Matching for VLA
+# Core idea: use normalized advantage DIRECTLY as flow matching weight (can be negative!)
+#   L = Ã * ||v_θ - u||² + β * ||v_θ - v_old||²
+# Key difference from FPI: Ã can be negative → pushes velocity AWAY from bad actions.
 
 defaults:
   - env/libero_object@env.train
@@ -25,7 +28,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_flowsar_mse_softplus_kl_0.5_openpi"
+    experiment_name: "libero_object_flowawm_clip0.5_kl0.5_openpi_quickstart"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -39,27 +42,26 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # ==================== FlowSAR Core ====================
-  loss_type: flow_sar
+  # ==================== FlowAWM Core ====================
+  loss_type: flow_awm
   adv_type: gae                      # not used, kept for compatibility
 
-  # FlowSAR hyperparameters
-  flow_sar_beta: 1.0                 # mirror construction parameter β
-  flow_sar_temperature: 1.0          # credit assignment softmax temperature
-  flow_sar_tau_mid: 0.5              # self-annotation reconstruction timestep
-  flow_sar_ema_beta: 0.995           # EMA update rate (only used when ema_schedule=fixed)
-  flow_sar_ema_schedule: fixed        # "fixed" (constant beta) or "linear" (DiffusionNFT-style dynamic)
-  flow_sar_ema_eta_rate: 0.001       # linear schedule: β_i = min(eta_rate * i, eta_max)
-  flow_sar_ema_eta_max: 0.5          # linear schedule: maximum retention rate
-  flow_sar_t_min: 0.0                # flow matching time sampling lower bound
-  flow_sar_t_max: 1.0                # flow matching time sampling upper bound
-  flow_sar_energy_type: mse          # "mse" (ODE velocity MSE) or "sde" (Flow-SDE Mahalanobis 1/2t)
-  flow_sar_loss_variant: softplus_kl  # "mse_branch" (DiffusionNFT-style) or "softplus_kl" (π-StepNFT-style contrastive + trust region)
-  flow_sar_kl_coeff: 1.0             # KL penalty coefficient (only used when loss_variant=softplus_kl)
-  flow_sar_w_min: 0.0                # weight clipping lower bound (0=no clip)
-  flow_sar_w_max: 1.0                # weight clipping upper bound (1=no clip)
+  # AWM-VLA hyperparameters
+  flow_awm_gamma: 0.99               # TD discount factor
+  flow_awm_gae_lambda: 0.95          # GAE smoothing factor (1.0=MC, 0.0=TD(0))
+  flow_awm_weight_mode: "linear"     # "linear" (original AWM, can be negative) or "exp" (AWR-style, always positive)
+  flow_awm_adv_clip: 0.5             # [linear mode] advantage clipping range c: Ã ∈ [-c, c]
+  flow_awm_beta: 1.0                 # [exp mode] temperature (smaller = more greedy)
+  flow_awm_max_weight: 6.0           # [exp mode] upper clamp for exp weights
+  flow_awm_value_coeff: 0.5          # value loss coefficient α
+  flow_awm_kl_coeff: 0.5             # trust region KL coefficient β
+  flow_awm_ema_beta: 0.995           # EMA for V_target network + v_old computation
+  flow_awm_t_min: 0.0                # flow time sampling min (full range)
+  flow_awm_t_max: 1.0                # flow time sampling max
+  flow_awm_value_warmup: 10          # epochs of pure BC while value head warms up
 
   # ==================== General ====================
+  normalize_advantages: True
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
@@ -143,9 +145,10 @@ actor:
   model:
     model_path: "/DATA/disk1/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5
-    add_value_head: False             # FlowSAR: no critic needed
+    add_value_head: True              # AWM: ENABLE value head for V(o,l)
     openpi:
-      detach_critic_input: False
+      value_after_vlm: True           # V(o,l) from VLM features (action-independent)
+      detach_critic_input: True        # CRITICAL: prevent value gradients from corrupting VLM features
 
   optim:
     lr: 1.0e-6

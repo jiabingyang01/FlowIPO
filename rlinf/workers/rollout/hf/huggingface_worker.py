@@ -77,12 +77,33 @@ class MultiStepRolloutWorker(Worker):
         _loss_type = cfg.algorithm.get("loss_type", "")
         self._is_flow_ipo = _loss_type == "flow_ipo"
         self._is_flow_sar = _loss_type == "flow_sar"
-        self._needs_ema_ref = self._is_flow_ipo or self._is_flow_sar
+        self._is_flow_fpi = _loss_type == "flow_fpi"
+        self._is_flow_awm = _loss_type == "flow_awm"
+        self._is_flow_gfn = _loss_type == "flow_gfn"
+        self._is_flow_nft = _loss_type == "flow_nft"
+        self._is_flow_hinge_nft = _loss_type == "flow_hinge_nft"
+        # NFT/Hinge-NFT do NOT need EMA ref model — all data comes from rollout SDE chain
+        # Hinge-NFT uses VLM embedding change rate for credit (zero cost, no EMA)
+        self._needs_ema_ref = self._is_flow_ipo or self._is_flow_sar or self._is_flow_fpi or self._is_flow_awm or self._is_flow_gfn
         if self._needs_ema_ref:
             self._ref_weights_cpu = None
             self._ref_swap_buffer = None
         if self._is_flow_ipo:
             self._flow_ipo_beta = cfg.algorithm.get("flow_ipo_beta_ref", 0.995)
+        if self._is_flow_fpi:
+            self._flow_fpi_ema_beta = cfg.algorithm.get("flow_fpi_ema_beta", 0.995)
+            self._flow_fpi_t_min = cfg.algorithm.get("flow_fpi_t_min", 0.0)
+            self._flow_fpi_t_max = cfg.algorithm.get("flow_fpi_t_max", 1.0)
+        if self._is_flow_awm:
+            self._flow_awm_ema_beta = cfg.algorithm.get("flow_awm_ema_beta", 0.995)
+            self._flow_awm_t_min = cfg.algorithm.get("flow_awm_t_min", 0.0)
+            self._flow_awm_t_max = cfg.algorithm.get("flow_awm_t_max", 1.0)
+        if self._is_flow_gfn:
+            self._flow_gfn_ema_beta = cfg.algorithm.get("flow_gfn_ema_beta", 0.995)
+            self._flow_gfn_denoise_steps = cfg.algorithm.get("flow_gfn_denoise_steps", 4)
+            self._flow_gfn_sigma_f = cfg.algorithm.get("flow_gfn_sigma_f", 0.1)
+            self._flow_gfn_t_min = cfg.algorithm.get("flow_gfn_t_min", 0.0)
+            self._flow_gfn_t_max = cfg.algorithm.get("flow_gfn_t_max", 1.0)
         if self._is_flow_sar:
             self._flow_sar_ema_beta = cfg.algorithm.get("flow_sar_ema_beta", 0.995)
             # DiffusionNFT-style dynamic EMA schedule: η_i = min(eta_rate * i, eta_max)
@@ -100,6 +121,12 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
+            # NFT / Hinge-NFT: enable snapshot collection in sample_actions
+            if self._is_flow_nft or self._is_flow_hinge_nft:
+                rollout_model_config.openpi.use_nft_loss = True
+            # VP-PPO: enable VLM embedding collection for PBRS reward shaping
+            if self.cfg.algorithm.get("use_vp_ppo", False):
+                rollout_model_config.openpi.collect_vlm_embedding = True
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
@@ -246,6 +273,12 @@ class MultiStepRolloutWorker(Worker):
         if self._needs_ema_ref:
             if self._is_flow_ipo:
                 beta = self._flow_ipo_beta
+            elif self._is_flow_fpi:
+                beta = self._flow_fpi_ema_beta
+            elif self._is_flow_awm:
+                beta = self._flow_awm_ema_beta
+            elif self._is_flow_gfn:
+                beta = self._flow_gfn_ema_beta
             elif self._is_flow_sar and self._flow_sar_ema_schedule == "linear":
                 # DiffusionNFT-style dynamic EMA: β_i = min(eta_rate * i, eta_max)
                 # Early iterations: β ≈ 0 → aggressive update (ref ≈ θ_new)
@@ -502,6 +535,207 @@ class MultiStepRolloutWorker(Worker):
                 fi["flow_t"] = t.cpu()
                 fi["flow_epsilon"] = epsilon.cpu()
 
+    @torch.no_grad()
+    def _compute_fpi_annotations(self, rollout_result: EmbodiedRolloutResult):
+        """
+        FPI: compute V_target, and pre-compute (t, ε, v_old) for trust region.
+
+        Phase 1: V_target(o_t) via EMA value head → TD target bootstrapping.
+        Phase 2: Pre-compute training data (t, ε, v_old) via EMA velocity →
+                 trust region anchor ||v_θ - v_old||² to prevent policy drift
+                 across multiple update epochs.
+
+        Stores: fpi_v_target, flow_t, flow_epsilon, v_old in forward_inputs.
+        """
+        from openpi.models import model as _model
+
+        t_min = self._flow_fpi_t_min
+        t_max = self._flow_fpi_t_max
+
+        with cpu_weight_swap(self.hf_model, self._ref_weights_cpu, self._ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                actions = fi.get("action", None)
+                if actions is None:
+                    continue
+
+                # Reconstruct observation from cached "~" keys
+                obs_dict = {}
+                for k, v in fi.items():
+                    if not k.startswith("~"):
+                        continue
+                    parts = k[1:].split("~", 1)
+                    val = v.to(self.device) if torch.is_tensor(v) else v
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                # --- Phase 1: V_target for TD bootstrapping ---
+                v_target_out = self.hf_model.forward_value(observation=observation)
+                fi["fpi_v_target"] = v_target_out["values"].cpu()  # [batch]
+
+                # --- Phase 2: Pre-compute (t, ε, v_old) for trust region ---
+                actions_gpu = actions.to(self.device)
+                bsz = actions_gpu.shape[0]
+
+                t = torch.rand(bsz, 1, 1, device=self.device) * (t_max - t_min) + t_min
+                epsilon = torch.randn_like(actions_gpu)
+                x_t = (1 - t) * actions_gpu + t * epsilon
+
+                v_old = self.hf_model.forward_velocity(
+                    None, x_t, t.reshape(bsz), observation=observation,
+                )
+                fi["v_old"] = v_old.cpu()
+                fi["flow_t"] = t.cpu()
+                fi["flow_epsilon"] = epsilon.cpu()
+
+    @torch.no_grad()
+    def _compute_awm_annotations(self, rollout_result: EmbodiedRolloutResult):
+        """
+        AWM-VLA: compute V_target + (t, ε, v_old) in a SINGLE VLM forward pass.
+
+        Uses forward_velocity(return_value=True) to get both v_old and V_target
+        from the same VLM prefix encoding, avoiding a redundant VLM forward.
+
+        Stores: awm_v_target, flow_t, flow_epsilon, v_old in forward_inputs.
+        """
+        from openpi.models import model as _model
+
+        t_min = self._flow_awm_t_min
+        t_max = self._flow_awm_t_max
+
+        with cpu_weight_swap(self.hf_model, self._ref_weights_cpu, self._ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                actions = fi.get("action", None)
+                if actions is None:
+                    continue
+
+                # Reconstruct observation from cached "~" keys
+                obs_dict = {}
+                for k, v in fi.items():
+                    if not k.startswith("~"):
+                        continue
+                    parts = k[1:].split("~", 1)
+                    val = v.to(self.device) if torch.is_tensor(v) else v
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                # Sample (t, ε) for trust region pre-computation
+                actions_gpu = actions.to(self.device)
+                bsz = actions_gpu.shape[0]
+                t = torch.rand(bsz, 1, 1, device=self.device) * (t_max - t_min) + t_min
+                epsilon = torch.randn_like(actions_gpu)
+                x_t = (1 - t) * actions_gpu + t * epsilon
+
+                # Single VLM forward: get both v_old AND V_target
+                result = self.hf_model.forward_velocity(
+                    None, x_t, t.reshape(bsz), observation=observation,
+                    return_value=True,
+                )
+                if isinstance(result, tuple):
+                    v_old, v_target = result
+                else:
+                    # Fallback if return_value not supported
+                    v_old = result
+                    v_target_out = self.hf_model.forward_value(observation=observation)
+                    v_target = v_target_out["values"]
+
+                fi["awm_v_target"] = v_target.cpu()
+                fi["v_old"] = v_old.cpu()
+                fi["flow_t"] = t.cpu()
+                fi["flow_epsilon"] = epsilon.cpu()
+
+    @torch.no_grad()
+    def _compute_gfn_annotations(self, rollout_result: EmbodiedRolloutResult):
+        """
+        GFN-Flow: generate K-step denoising chain with EMA model + pre-compute v_old.
+
+        Uses forward_velocity() for each chain step (high-level API, robust serialization).
+        Each call does its own VLM encoding — slower than KV cache reuse, but avoids
+        tensor lifecycle issues with Ray serialization.
+
+        Stores: gfn_chain [bsz, K+1, horizon, dim], gfn_timesteps [K+1],
+                v_old, flow_t, flow_epsilon in forward_inputs.
+        """
+        from openpi.models import model as _model
+
+        K = self._flow_gfn_denoise_steps
+        sigma_f = self._flow_gfn_sigma_f
+        t_min = self._flow_gfn_t_min
+        t_max = self._flow_gfn_t_max
+
+        with cpu_weight_swap(self.hf_model, self._ref_weights_cpu, self._ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                actions = fi.get("action", None)
+                if actions is None:
+                    continue
+
+                # Reconstruct observation from cached "~" keys
+                obs_dict = {}
+                for k_key, v_val in fi.items():
+                    if not k_key.startswith("~"):
+                        continue
+                    parts = k_key[1:].split("~", 1)
+                    val = v_val.to(self.device) if torch.is_tensor(v_val) else v_val
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                actions_gpu = actions.to(self.device)
+                bsz = actions_gpu.shape[0]
+
+                # Timestep schedule: t=1 (noise) → t=0 (clean)
+                timesteps = torch.linspace(1.0, 1.0 / K, K, device=self.device)
+                timesteps = torch.cat([timesteps, torch.zeros(1, device=self.device)])  # [K+1]
+
+                # K-step stochastic denoising chain using forward_velocity()
+                chain = []  # K+1 states
+                x_t = torch.randn_like(actions_gpu)  # start from pure noise
+                chain.append(x_t.clone())
+
+                for step_k in range(K):
+                    t_k = timesteps[step_k]
+                    t_k_batch = t_k.expand(bsz)
+
+                    # Use high-level API (each call does its own VLM encoding)
+                    v_k = self.hf_model.forward_velocity(
+                        None, x_t, t_k_batch, observation=observation,
+                    )
+
+                    # Euler step: x_{k+1} = x_k - v_θ * δ_k
+                    delta_k = timesteps[step_k] - timesteps[step_k + 1]
+
+                    if step_k < K - 1:
+                        x_t = x_t - v_k * delta_k + sigma_f * torch.randn_like(x_t)
+                    else:
+                        x_t = x_t - v_k * delta_k
+
+                    chain.append(x_t.clone())
+
+                # Stack chain: [bsz, K+1, horizon, dim]
+                gfn_chain = torch.stack(chain, dim=1).contiguous()
+
+                # Pre-compute v_old at random (t, ε) for trust region
+                t = torch.rand(bsz, 1, 1, device=self.device) * (t_max - t_min) + t_min
+                epsilon = torch.randn_like(actions_gpu)
+                x_t_reg = (1 - t) * actions_gpu + t * epsilon
+
+                v_old = self.hf_model.forward_velocity(
+                    None, x_t_reg, t.reshape(bsz), observation=observation,
+                )
+
+                fi["gfn_chain"] = gfn_chain.cpu()
+                fi["gfn_timesteps"] = timesteps.cpu()
+                fi["v_old"] = v_old.cpu()
+                fi["flow_t"] = t.cpu()
+                fi["flow_epsilon"] = epsilon.cpu()
+
     async def generate(
         self, input_channel: Channel, output_channel: Channel, actor_channel: Channel
     ):
@@ -531,6 +765,12 @@ class MultiStepRolloutWorker(Worker):
                     self._compute_reference_actions(self.rollout_results[stage_id])
                 elif self._is_flow_sar:
                     self._compute_self_annotation(self.rollout_results[stage_id])
+                elif self._is_flow_fpi:
+                    self._compute_fpi_annotations(self.rollout_results[stage_id])
+                elif self._is_flow_awm:
+                    self._compute_awm_annotations(self.rollout_results[stage_id])
+                elif self._is_flow_gfn:
+                    self._compute_gfn_annotations(self.rollout_results[stage_id])
 
         for stage_id in range(self.num_pipeline_stages):
             await self.send_rollout_trajectories(

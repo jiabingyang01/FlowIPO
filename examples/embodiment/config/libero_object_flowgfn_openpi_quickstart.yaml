@@ -1,5 +1,8 @@
-# FlowSAR quickstart configuration for LIBERO Object tasks with OpenPi (π0)
-# Based on libero_object_flowipo_openpi_quickstart.yaml, adapted for FlowSAR.
+# GFN-Flow quickstart configuration for LIBERO Object tasks with OpenPi (π0)
+# GFlowNet-guided denoising for diversity-preserving RL of flow-based VLAs.
+# Core idea: model K-step denoising as a GFlowNet DAG, train with SubTB loss.
+#   π(a|s) ∝ R(a,s) — preserves action diversity while improving performance.
+# Key difference from FPI/AWM: no advantage weighting, uses flow balance instead.
 
 defaults:
   - env/libero_object@env.train
@@ -25,7 +28,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_flowsar_mse_softplus_kl_0.5_openpi"
+    experiment_name: "libero_object_flowgfn_kl0.5_openpi_quickstart"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -39,27 +42,26 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # ==================== FlowSAR Core ====================
-  loss_type: flow_sar
-  adv_type: gae                      # not used, kept for compatibility
+  # ==================== GFN-Flow Core ====================
+  loss_type: flow_gfn
+  adv_type: gae                       # not used, kept for compatibility
 
-  # FlowSAR hyperparameters
-  flow_sar_beta: 1.0                 # mirror construction parameter β
-  flow_sar_temperature: 1.0          # credit assignment softmax temperature
-  flow_sar_tau_mid: 0.5              # self-annotation reconstruction timestep
-  flow_sar_ema_beta: 0.995           # EMA update rate (only used when ema_schedule=fixed)
-  flow_sar_ema_schedule: fixed        # "fixed" (constant beta) or "linear" (DiffusionNFT-style dynamic)
-  flow_sar_ema_eta_rate: 0.001       # linear schedule: β_i = min(eta_rate * i, eta_max)
-  flow_sar_ema_eta_max: 0.5          # linear schedule: maximum retention rate
-  flow_sar_t_min: 0.0                # flow matching time sampling lower bound
-  flow_sar_t_max: 1.0                # flow matching time sampling upper bound
-  flow_sar_energy_type: mse          # "mse" (ODE velocity MSE) or "sde" (Flow-SDE Mahalanobis 1/2t)
-  flow_sar_loss_variant: softplus_kl  # "mse_branch" (DiffusionNFT-style) or "softplus_kl" (π-StepNFT-style contrastive + trust region)
-  flow_sar_kl_coeff: 1.0             # KL penalty coefficient (only used when loss_variant=softplus_kl)
-  flow_sar_w_min: 0.0                # weight clipping lower bound (0=no clip)
-  flow_sar_w_max: 1.0                # weight clipping upper bound (1=no clip)
+  # GFN-Flow hyperparameters
+  flow_gfn_denoise_steps: 4           # K: DAG depth (number of denoising steps)
+  flow_gfn_sigma_f: 0.1              # forward policy noise σ_f
+  flow_gfn_sigma_b: 0.1              # backward policy noise σ_b
+  flow_gfn_subtb_lambda: 1.0         # SubTB geometric weighting (λ^length)
+  flow_gfn_boundary_coeff: 1.0       # boundary loss weight (log F(s_K) - log R)²
+  flow_gfn_kl_coeff: 0.5             # trust region ||v_θ - v_old||² coefficient
+  flow_gfn_flow_loss_coeff: 1.0      # SubTB + boundary loss coefficient
+  flow_gfn_ema_beta: 0.995           # EMA decay for chain generation model
+  flow_gfn_warmup: 5                 # warmup epochs (pure BC, only train F_ψ)
+  flow_gfn_reward_floor: 0.01        # floor reward ε (GFN requires R > 0)
+  flow_gfn_t_min: 0.0                # flow time sampling min for trust region
+  flow_gfn_t_max: 1.0                # flow time sampling max for trust region
 
   # ==================== General ====================
+  normalize_advantages: True
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
@@ -136,20 +138,22 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 64
+  micro_batch_size: 16                # GFN needs K+2=6 suffix forwards (vs 1 for AWM), reduce batch
   global_batch_size: 512
   seed: 42
   enable_offload: True
   model:
     model_path: "/DATA/disk1/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5
-    add_value_head: False             # FlowSAR: no critic needed
+    add_value_head: False             # GFN does NOT need value head V(o,l)
+    add_state_flow_net: True          # ENABLE State Flow Network F_ψ
     openpi:
-      detach_critic_input: False
+      value_after_vlm: False          # N/A for GFN
+      detach_critic_input: True       # prevent F_ψ gradients from corrupting action expert
 
   optim:
     lr: 1.0e-6
-    value_lr: 1.0e-4
+    value_lr: 1.0e-4                  # learning rate for F_ψ parameters
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
@@ -160,7 +164,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    gradient_checkpointing: False
+    gradient_checkpointing: True       # GFN has K+2 suffix forwards, need checkpointing to fit
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

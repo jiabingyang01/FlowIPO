@@ -28,6 +28,7 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
+from rlinf.models.embodiment.modules.state_flow_net import StateFlowNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
 
 
@@ -63,6 +64,14 @@ class OpenPi0Config(Pi0Config):
     add_value_head: bool = False  # add value head for ppo
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
+    # NFT (π-StepNFT contrastive flow RL)
+    use_nft_loss: bool = False  # enable NFT snapshot collection in sample_actions
+    # VP-PPO: collect VLM embedding for PBRS reward shaping (also used by NFT FEA)
+    collect_vlm_embedding: bool = False
+    # GFN-Flow (state flow network)
+    add_state_flow_net: bool = False  # add state flow network for GFN-Flow
+    state_flow_hidden_sizes: tuple = (512, 256, 128)
+    state_flow_time_embed_dim: int = 64
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -143,6 +152,22 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
             self.config, "add_value_head", False
         )
+        # State flow network for GFN-Flow
+        if getattr(self.config, "add_state_flow_net", False):
+            # State flow net uses suffix_out (action expert features) as input
+            # suffix_out dim is 1024 for both pi0 and pi05 (action expert hidden dim)
+            flow_input_dim = 1024
+            if self.config.config_name in ["pi05_maniskill", "pi05_libero"]:
+                flow_hidden = (1024, 512, 256)
+            else:
+                flow_hidden = getattr(self.config, "state_flow_hidden_sizes", (512, 256, 128))
+            flow_time_dim = getattr(self.config, "state_flow_time_embed_dim", 64)
+            self.state_flow_net = StateFlowNet(
+                input_dim=flow_input_dim,
+                time_embed_dim=flow_time_dim,
+                hidden_sizes=flow_hidden,
+                activation="gelu",
+            )
         # noise head for flow-noise
         if self.config.noise_method == "flow_noise":
             self.noise_head = ExploreNoiseNet(
@@ -238,6 +263,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.default_forward(**kwargs)
         elif forward_type == ForwardType.VELOCITY:
             return self.forward_velocity(**kwargs)
+        elif forward_type == ForwardType.VALUE:
+            return self.forward_value(**kwargs)
+        elif forward_type == ForwardType.GFN_CHAIN:
+            return self.forward_gfn_chain(**kwargs)
         else:
             raise NotImplementedError
 
@@ -366,22 +395,29 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )["actions"].numpy()
 
         forward_inputs = {
-            "chains": outputs["chains"],
-            "denoise_inds": outputs["denoise_inds"],
-            # FlowIPO: store initial noise for reference action generation
-            "initial_noise": outputs["chains"][:, 0],  # chains[0] = initial noise ε₀
-            # FlowIPO: store raw denoised actions for credit assignment (δ_i computation)
             "action": outputs["actions"],  # [batch, action_horizon, action_dim]
             "observation/image": env_obs["main_images"],
             "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
         }
+        # chains/denoise_inds: only present for non-NFT methods (FlowSAR, FPI, AWM, etc.)
+        # NFT returns early without chains (matching pi-StepNFT behavior)
+        if "chains" in outputs:
+            forward_inputs["chains"] = outputs["chains"]
+            forward_inputs["initial_noise"] = outputs["chains"][:, 0]
+        if "denoise_inds" in outputs:
+            forward_inputs["denoise_inds"] = outputs["denoise_inds"]
         if env_obs["wrist_images"] is not None:
             forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
         forward_inputs.update(_cached_proc)  # FlowIPO: cached processed obs
+
+        # NFT: copy snapshot traces and VLM embedding into forward_inputs
+        for _nft_key in ("nft_xt", "nft_v", "nft_xnext", "nft_step_index", "nft_noise_level", "vlm_embedding"):
+            if _nft_key in outputs:
+                forward_inputs[_nft_key] = outputs[_nft_key]
 
         result = {
             "prev_logprobs": outputs["prev_logprobs"],
@@ -435,9 +471,87 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         values = []
         chains.append(x_t)
 
+        # NFT: snapshot collection setup
+        use_nft = getattr(self.config, "use_nft_loss", False)
+        collect_flow_snap = use_nft and self.config.noise_method == "flow_sde"
+        if collect_flow_snap:
+            flow_rand_idx = torch.randint(0, num_steps, (bsize,), device=device)
+            flow_xt_snap = torch.empty_like(noise)
+            flow_v_snap = torch.empty_like(noise)
+            flow_xnext_snap = torch.empty_like(noise)
+            flow_idx_snap = flow_rand_idx.clone()
+            if self.config.noise_anneal:
+                noise_start, noise_end, anneal_steps = self.config.noise_params
+                nft_noise_level_val = torch.tensor(
+                    noise_start + (noise_end - noise_start) * min(self.global_step, anneal_steps) / anneal_steps,
+                    device=device,
+                )
+            else:
+                nft_noise_level_val = torch.tensor(self.config.noise_level, device=device)
+
+        # Cache pooled VLM embedding (for NFT FEA or VP-PPO PBRS reward shaping)
+        vlm_embedding = None
+        collect_vlm_emb = use_nft or getattr(self.config, "collect_vlm_embedding", False)
+        if collect_vlm_emb:
+            vlm_embedding = prefix_output.mean(dim=1).detach()  # [bs, hidden_dim]
+
         # add value based on the vlm for pi05, expert for pi0
         if self.use_vlm_value:
             values_vlm = self.get_value_from_vlm(prefix_output)
+
+        # ================================================================
+        # NFT: SEPARATE denoising branch — ALL steps use flow_sde noise
+        # Matches pi-StepNFT (line 694): use_nft → dedicated SDE loop → early return
+        # The normal loop below mixes ODE (eval) and SDE (train) modes,
+        # which breaks NFT (variance model assumes all steps have SDE noise)
+        # ================================================================
+        if collect_flow_snap:
+            for idx in range(num_steps):
+                x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
+                    x_t, idx, state, prefix_pad_masks, past_key_values,
+                    mode="train",  # ALL steps use SDE noise (critical for NFT)
+                    denoise_steps=num_steps,
+                    compute_values=False,
+                )
+                # Capture (x_t, v_t) BEFORE Euler step
+                mask = flow_rand_idx == idx
+                if mask.any():
+                    flow_xt_snap[mask] = x_t.detach()[mask]
+                    flow_v_snap[mask] = v_t.detach()[mask]
+                # Euler step with SDE noise
+                x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+                # Capture x_next AFTER Euler step
+                if mask.any():
+                    flow_xnext_snap[mask] = x_t.detach()[mask]
+
+            x_0 = x_t
+            # Dummy logprobs (NFT doesn't use logprobs for training)
+            dummy_logprobs = torch.zeros(
+                (bsize, 1, self.config.action_chunk, self.config.action_env_dim),
+                device=device, dtype=x_0.dtype,
+            )
+            # Values
+            if self.use_vlm_value:
+                nft_values = values_vlm[:, None]
+            else:
+                nft_values = torch.zeros((bsize, 1), device=device, dtype=x_0.dtype)
+
+            result = {
+                "actions": x_0,
+                "prev_logprobs": dummy_logprobs,
+                "prev_values": nft_values,
+                "nft_xt": flow_xt_snap,
+                "nft_v": flow_v_snap[:, :self.config.action_chunk],
+                "nft_xnext": flow_xnext_snap,
+                "nft_step_index": flow_idx_snap,
+                "nft_noise_level": nft_noise_level_val.detach().expand(bsize),
+            }
+            if vlm_embedding is not None:
+                result["vlm_embedding"] = vlm_embedding
+            return result
+        # ================================================================
+        # Normal denoising path (non-NFT: FlowSAR, FPI, AWM, GFN, PPO, etc.)
+        # ================================================================
         if self.config.joint_logprob:
             initial_log_prob = self.get_logprob_norm(
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
@@ -470,7 +584,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample_mode = "train"
             else:
                 sample_mode = "eval"
-            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+            x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
                 x_t,
                 idx,
                 state,
@@ -505,13 +619,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
-        return {
+
+        result = {
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
+        if vlm_embedding is not None:
+            result["vlm_embedding"] = vlm_embedding
+
+        return result
 
     def sample_mean_var_val(
         self,
@@ -616,7 +735,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 raise ValueError(f"Invalid noise method: {self.config.noise_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
-        return x_t_mean, x_t_std, value_t
+        return x_t_mean, x_t_std, value_t, v_t
 
     def get_suffix_out(
         self,
@@ -672,6 +791,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         x_t: torch.Tensor,
         timestep: torch.Tensor,
         observation=None,
+        return_value: bool = False,
     ) -> torch.Tensor:
         """
         FlowIPO: compute velocity prediction v_θ(x_t, t, s) for a given
@@ -682,9 +802,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             x_t: Noisy actions, shape [batch, action_horizon, action_dim].
             timestep: Flow matching time t, shape [batch].
             observation: Optional pre-processed Observation (skips input_transform).
+            return_value: If True, also compute V(o,l) from prefix_output in the
+                same VLM forward pass (saves one full VLM encoding). Used by AWM-VLA.
 
         Returns:
-            v_theta: Predicted velocity, shape [batch, action_horizon, action_dim].
+            v_theta if return_value=False, else (v_theta, values).
         """
         if observation is None:
             observation = self.input_transform(forward_inputs, transpose=False)
@@ -720,7 +842,184 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             state, prefix_pad_masks, past_key_values, x_t, timestep
         )
         v_theta = self.action_out_proj(suffix_out)
+
+        if return_value and hasattr(self, 'use_vlm_value') and self.use_vlm_value:
+            # Compute value from same prefix_output (no extra VLM forward!)
+            # get_value_from_vlm() handles detach internally
+            values = self.get_value_from_vlm(prefix_output)
+            return v_theta, values
+
         return v_theta
+
+    def forward_value(
+        self,
+        forward_inputs: dict[str, torch.Tensor] = None,
+        observation=None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """
+        FPI: compute V(o, l) from observation encoding + value head only.
+
+        No ODE sampling or velocity computation — just VLM prefix encoding
+        followed by the value head. Requires add_value_head=True and
+        value_after_vlm=True in model config.
+
+        Args:
+            forward_inputs: Dict containing observation data (images, state, tokens).
+            observation: Optional pre-processed Observation (skips input_transform).
+
+        Returns:
+            Dict with "values" tensor of shape [batch].
+        """
+        if observation is None:
+            observation = self.input_transform(forward_inputs, transpose=False)
+            observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        device = next(self.parameters()).device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+
+        # VLM prefix encoding (images + language)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        (prefix_output, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+
+        # Value head on VLM output features
+        value = self.get_value_from_vlm(prefix_output)
+        return {"values": value}
+
+    def forward_gfn_chain(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        gfn_chain: torch.Tensor,
+        gfn_timesteps: torch.Tensor,
+        x_t_reg: torch.Tensor = None,
+        timestep_reg: torch.Tensor = None,
+        observation=None,
+    ) -> dict[str, Any]:
+        """
+        GFN-Flow: Efficient K-step chain evaluation with 1 VLM prefix + (K+2) suffix forwards.
+
+        For each denoising step k=0..K:
+          - get_suffix_out(x_k, t_k) → suffix_out (reuses VLM KV cache)
+          - velocity v_k = action_out_proj(suffix_out) [only k<K]
+          - log_flow F_psi = state_flow_net(pooled_suffix_out, t_k)
+
+        Optionally computes trust region velocity at (x_t_reg, timestep_reg).
+
+        Args:
+            forward_inputs: Dict with observation data.
+            gfn_chain: [batch, K+1, action_horizon, action_dim] denoising chain states.
+            gfn_timesteps: [K+1] timestep schedule (code convention: t=1→noise).
+            x_t_reg: Optional [batch, horizon, dim] for trust region velocity.
+            timestep_reg: Optional [batch] for trust region.
+            observation: Optional pre-processed Observation.
+
+        Returns:
+            Dict with:
+              velocities: [batch, K, action_horizon, action_dim]
+              log_flows: [batch, K+1]
+              v_reg: [batch, horizon, dim] or None (trust region velocity)
+        """
+        if observation is None:
+            observation = self.input_transform(forward_inputs, transpose=False)
+            observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        device = gfn_chain.device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+
+        # 1 VLM prefix encoding (EXPENSIVE, done ONCE)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        batch_size = gfn_chain.shape[0]
+        K = gfn_chain.shape[1] - 1  # K denoising steps, K+1 states
+        gfn_timesteps = gfn_timesteps.to(device)
+
+        velocities = []   # [K] of [batch, action_horizon, action_dim]
+        log_flows = []    # [K+1] of [batch]
+
+        # K+1 suffix forwards (CHEAP, reuses VLM KV cache)
+        for k in range(K + 1):
+            x_k = gfn_chain[:, k]  # [batch, action_horizon, action_dim]
+            t_k = gfn_timesteps[k]
+            t_k_batch = t_k.expand(batch_size)
+
+            suffix_out = self.get_suffix_out(
+                state, prefix_pad_masks, past_key_values, x_k, t_k_batch,
+            )
+
+            # Velocity prediction (only for k=0..K-1)
+            if k < K:
+                v_k = self.action_out_proj(suffix_out)
+                velocities.append(v_k)
+
+            # State flow F_psi
+            if hasattr(self, "state_flow_net"):
+                if self.config.chunk_critic_input:
+                    pooled = torch.mean(
+                        suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
+                    )
+                else:
+                    pooled = torch.mean(suffix_out, dim=1, keepdim=False)
+                # Match state_flow_net param dtype (bfloat16 for FSDP compatibility)
+                flow_dtype = next(self.state_flow_net.parameters()).dtype
+                pooled = pooled.to(dtype=flow_dtype)
+                if self.config.detach_critic_input:
+                    pooled = pooled.detach()
+                log_f = self.state_flow_net(pooled, t_k_batch.to(dtype=flow_dtype))
+                log_flows.append(log_f)
+
+        velocities = torch.stack(velocities, dim=1)  # [batch, K, horizon, dim]
+        log_flows = torch.stack(log_flows, dim=1)     # [batch, K+1]
+
+        # Optional: trust region velocity at (x_t_reg, timestep_reg)
+        v_reg = None
+        if x_t_reg is not None and timestep_reg is not None:
+            suffix_out_reg = self.get_suffix_out(
+                state, prefix_pad_masks, past_key_values, x_t_reg, timestep_reg,
+            )
+            v_reg = self.action_out_proj(suffix_out_reg)
+
+        return {
+            "velocities": velocities,
+            "log_flows": log_flows,
+            "v_reg": v_reg,
+        }
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):
@@ -792,7 +1091,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             denoise_ind = denoise_inds[:, idx]
             chains_pre = chains[torch.arange(bsize), denoise_ind]
             chains_next = chains[torch.arange(bsize), denoise_ind + 1]
-            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+            x_t_mean, x_t_std, value_t, _ = self.sample_mean_var_val(
                 chains_pre,
                 denoise_ind,
                 state,
@@ -845,6 +1144,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
         prefix_out_value = prefix_out_value.to(dtype=torch.float32)
+        # Detach to prevent value loss gradients from corrupting VLM features
+        if self.config.detach_critic_input:
+            prefix_out_value = prefix_out_value.detach()
         values_vlm = self.value_head(prefix_out_value)[:, 0]
         return values_vlm
 

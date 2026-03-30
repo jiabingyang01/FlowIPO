@@ -15,6 +15,7 @@
 
 import os
 
+import torch
 from omegaconf import DictConfig
 
 
@@ -57,6 +58,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     for weight_path in weight_paths:
         safetensors.torch.load_model(model, weight_path, strict=False)
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    # Convert auxiliary heads to bfloat16 for FSDP dtype uniformity
+    if hasattr(model, "state_flow_net"):
+        model.state_flow_net.to(torch.bfloat16)
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

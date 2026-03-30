@@ -30,7 +30,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 40
+  save_interval: 500
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -41,7 +41,7 @@ algorithm:
   group_size: 1
   reward_coef: 1.0
 
-  rollout_epoch: 2
+  rollout_epoch: 1
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level

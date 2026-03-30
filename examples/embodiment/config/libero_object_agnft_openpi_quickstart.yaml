@@ -1,5 +1,15 @@
-# FlowSAR quickstart configuration for LIBERO Object tasks with OpenPi (π0)
-# Based on libero_object_flowipo_openpi_quickstart.yaml, adapted for FlowSAR.
+# AG-NFT (Advantage-Guided NFT) quickstart configuration for LIBERO Object tasks with OpenPi (π0)
+# Based on libero_object_flownft_openpi_quickstart.yaml.
+#
+# Key differences from FlowNFT:
+# - flow_nft_adv_type: gae (GAE per-step advantages instead of terminal binary)
+# - add_value_head: True (VLM-based value network for GAE computation)
+# - value_after_vlm: True (V(o,l) from frozen VLM prefix features)
+# - detach_critic_input: True (prevent value gradients from corrupting VLM backbone)
+#
+# AG-NFT combines NFT's O(1) contrastive gradient with GAE per-step credit assignment.
+# The softplus structure auto-gates noisy labels: when value network is inaccurate,
+# |y| ≈ 0 → NFT ignores those steps. As value improves, per-step credit activates.
 
 defaults:
   - env/libero_object@env.train
@@ -25,7 +35,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_flowsar_mse_softplus_kl_0.5_openpi"
+    experiment_name: "libero_object_agnft_openpi"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -39,25 +49,25 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # ==================== FlowSAR Core ====================
-  loss_type: flow_sar
-  adv_type: gae                      # not used, kept for compatibility
+  # ==================== FlowNFT Core (unchanged) ====================
+  loss_type: flow_nft
+  adv_type: gae                      # kept for compatibility
 
-  # FlowSAR hyperparameters
-  flow_sar_beta: 1.0                 # mirror construction parameter β
-  flow_sar_temperature: 1.0          # credit assignment softmax temperature
-  flow_sar_tau_mid: 0.5              # self-annotation reconstruction timestep
-  flow_sar_ema_beta: 0.995           # EMA update rate (only used when ema_schedule=fixed)
-  flow_sar_ema_schedule: fixed        # "fixed" (constant beta) or "linear" (DiffusionNFT-style dynamic)
-  flow_sar_ema_eta_rate: 0.001       # linear schedule: β_i = min(eta_rate * i, eta_max)
-  flow_sar_ema_eta_max: 0.5          # linear schedule: maximum retention rate
-  flow_sar_t_min: 0.0                # flow matching time sampling lower bound
-  flow_sar_t_max: 1.0                # flow matching time sampling upper bound
-  flow_sar_energy_type: mse          # "mse" (ODE velocity MSE) or "sde" (Flow-SDE Mahalanobis 1/2t)
-  flow_sar_loss_variant: softplus_kl  # "mse_branch" (DiffusionNFT-style) or "softplus_kl" (π-StepNFT-style contrastive + trust region)
-  flow_sar_kl_coeff: 1.0             # KL penalty coefficient (only used when loss_variant=softplus_kl)
-  flow_sar_w_min: 0.0                # weight clipping lower bound (0=no clip)
-  flow_sar_w_max: 1.0                # weight clipping upper bound (1=no clip)
+  # NFT hyperparameters (π-StepNFT paper defaults)
+  flow_nft_beta: 1.0                 # mirror construction scale β
+  flow_nft_kl_beta: 0.0001           # KL trust region weight
+  flow_nft_max_drift: 0.5            # velocity drift clipping
+  flow_nft_dpo_beta: 1.0             # DPO loss temperature
+  flow_nft_noise_level: 0.2          # SDE exploration noise
+  flow_nft_adv_clip_max: 1.0         # advantage clipping magnitude
+
+  # ==================== AG-NFT Specific ====================
+  flow_nft_adv_type: gae             # "gae" for AG-NFT, "terminal_binary" for standard NFT
+  flow_nft_value_coeff: 0.5          # value loss weight in total loss
+
+  # FEA settings (unused when adv_type=gae, kept for compatibility)
+  flow_nft_fea_gamma: 0.99
+  flow_nft_fea_ridge_lambda: 1.0
 
   # ==================== General ====================
   kl_penalty: kl
@@ -105,17 +115,17 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
-    total_num_envs: 32
+    total_num_envs: 64
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
-    single_task_id: 0               # train on task 0 only, set to null for all tasks
+    single_task_id: null
   eval:
     total_num_envs: 500
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
-    single_task_id: 0               # eval on task 0 only, set to null for all tasks
+    single_task_id: null
     group_size: 1
     is_eval: True
     video_cfg:
@@ -143,19 +153,23 @@ actor:
   model:
     model_path: "/DATA/disk1/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5
-    add_value_head: False             # FlowSAR: no critic needed
+    add_value_head: True              # AG-NFT: enable VLM value head
     openpi:
-      detach_critic_input: False
+      detach_critic_input: True       # AG-NFT: prevent value gradients from corrupting VLM
+      value_after_vlm: True           # AG-NFT: V(o,l) from VLM prefix features
+      use_nft_loss: True              # enable NFT snapshot collection
+      noise_method: flow_sde          # must be flow_sde for NFT
+      noise_level: 0.2                # SDE noise level
 
   optim:
     lr: 1.0e-6
-    value_lr: 1.0e-4
+    value_lr: 1.0e-4                  # separate LR for value head
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
-    critic_warmup_steps: 0
+    critic_warmup_steps: 0            # 0: self-calibration makes explicit warmup unnecessary
 
   fsdp_config:
     strategy: "fsdp"

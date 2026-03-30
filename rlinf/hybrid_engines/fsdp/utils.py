@@ -189,6 +189,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         )
         policies.append(value_head_policy)
 
+    if hasattr(module, "state_flow_net"):
+        from rlinf.models.embodiment.modules.state_flow_net import StateFlowNet
+
+        state_flow_policy = functools.partial(
+            _module_wrap_policy, module_classes={StateFlowNet}
+        )
+        policies.append(state_flow_policy)
+
     if hasattr(module, "q_head"):
         from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 

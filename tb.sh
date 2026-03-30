@@ -1,0 +1,1 @@
+tensorboard --logdir /DATA/disk1/yjb/projects/VLA/FlowIPO/logs/20260330-03:05:58-libero_object_agnft_openpi/tensorboard --port 6006

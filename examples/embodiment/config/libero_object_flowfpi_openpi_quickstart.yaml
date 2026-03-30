@@ -1,5 +1,7 @@
-# FlowSAR quickstart configuration for LIBERO Object tasks with OpenPi (π0)
-# Based on libero_object_flowipo_openpi_quickstart.yaml, adapted for FlowSAR.
+# FlowFPI quickstart configuration for LIBERO Object tasks with OpenPi (π0)
+# Based on FlowSAR config, adapted for FPI (Flow Policy Iteration).
+# FPI = Advantage-Weighted Flow Matching: L = w * ||v_θ - u||²
+# where w = exp(A/λ) / mean(exp(A/λ)), A = advantage from value network.
 
 defaults:
   - env/libero_object@env.train
@@ -25,7 +27,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_flowsar_mse_softplus_kl_0.5_openpi"
+    experiment_name: "libero_object_flowfpi_openpi"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -39,27 +41,25 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # ==================== FlowSAR Core ====================
-  loss_type: flow_sar
+  # ==================== FlowFPI Core ====================
+  loss_type: flow_fpi
   adv_type: gae                      # not used, kept for compatibility
 
-  # FlowSAR hyperparameters
-  flow_sar_beta: 1.0                 # mirror construction parameter β
-  flow_sar_temperature: 1.0          # credit assignment softmax temperature
-  flow_sar_tau_mid: 0.5              # self-annotation reconstruction timestep
-  flow_sar_ema_beta: 0.995           # EMA update rate (only used when ema_schedule=fixed)
-  flow_sar_ema_schedule: fixed        # "fixed" (constant beta) or "linear" (DiffusionNFT-style dynamic)
-  flow_sar_ema_eta_rate: 0.001       # linear schedule: β_i = min(eta_rate * i, eta_max)
-  flow_sar_ema_eta_max: 0.5          # linear schedule: maximum retention rate
-  flow_sar_t_min: 0.0                # flow matching time sampling lower bound
-  flow_sar_t_max: 1.0                # flow matching time sampling upper bound
-  flow_sar_energy_type: mse          # "mse" (ODE velocity MSE) or "sde" (Flow-SDE Mahalanobis 1/2t)
-  flow_sar_loss_variant: softplus_kl  # "mse_branch" (DiffusionNFT-style) or "softplus_kl" (π-StepNFT-style contrastive + trust region)
-  flow_sar_kl_coeff: 1.0             # KL penalty coefficient (only used when loss_variant=softplus_kl)
-  flow_sar_w_min: 0.0                # weight clipping lower bound (0=no clip)
-  flow_sar_w_max: 1.0                # weight clipping upper bound (1=no clip)
+  # FPI hyperparameters
+  flow_fpi_lambda: 5.0               # advantage temperature (large→BC, small→greedy; 5.0 is conservative)
+  flow_fpi_gamma: 0.99               # TD discount factor
+  flow_fpi_w_min: 0.0                # weight clip min
+  flow_fpi_w_max: 5.0                # weight clip max (tighter than 10 to prevent instability)
+  flow_fpi_value_coeff: 0.5          # value loss coefficient
+  flow_fpi_kl_coeff: 1.0             # trust region: ||v_θ - v_old||² penalty (prevents drift)
+  flow_fpi_ema_beta: 0.995           # EMA for V_target network + v_old computation
+  flow_fpi_t_min: 0.0                # flow time sampling min (full range)
+  flow_fpi_t_max: 1.0                # flow time sampling max
+  flow_fpi_value_warmup: 10          # epochs of pure BC (w=1) while value head warms up
+  flow_fpi_adv_normalize: True       # normalize advantages before exp() to prevent weight explosion
 
   # ==================== General ====================
+  normalize_advantages: True
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
@@ -143,9 +143,10 @@ actor:
   model:
     model_path: "/DATA/disk1/yjb/projects/VLA/FlowIPO/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5
-    add_value_head: False             # FlowSAR: no critic needed
+    add_value_head: True              # FPI: ENABLE value head for V(o,l)
     openpi:
-      detach_critic_input: False
+      value_after_vlm: True           # V(o,l) from VLM features (action-independent)
+      detach_critic_input: True        # CRITICAL: prevent value gradients from corrupting VLM features
 
   optim:
     lr: 1.0e-6
