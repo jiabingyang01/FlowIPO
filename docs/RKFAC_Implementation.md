@@ -98,7 +98,7 @@ L_actor = α · E_res - min_j Q_j(s, a_θ)
 |------|---------|--------|
 | `rlinf/algorithms/registry.py` | `"flow_rkfac"` 加入 bypass 列表 | +1 |
 | `rlinf/models/embodiment/base_policy.py` | `ForwardType.RKFAC_ODE` | +1 |
-| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `forward_rkfac_ode()` + `_frozen_expert_velocities()` + dispatch | +130 |
+| `rlinf/models/embodiment/openpi/openpi_action_model.py` | `forward_rkfac_ode()` (gradient checkpointed) + `_save/_load_action_expert_state()` + dispatch | +130 |
 | `rlinf/algorithms/losses.py` | `compute_residual_kinetic_energy()` + `flow_rkfac` loss placeholder | +45 |
 | `rlinf/workers/rollout/hf/huggingface_worker.py` | RK-FAC 检测 + `collect_vlm_embedding` | +3 |
 | `rlinf/workers/actor/fsdp_actor_worker.py` | Init (Q, target Q, α, frozen ref) + credit assignment + training branch | +170 |
@@ -112,29 +112,34 @@ L_actor = α · E_res - min_j Q_j(s, a_θ)
 
 ## 5. 关键实现细节
 
-### 5.1 两阶段 ODE Forward (`forward_rkfac_ode`)
+### 5.1 Gradient-Checkpointed Interleaved ODE Forward (`forward_rkfac_ode`)
 
-`forward_rkfac_ode()` 采用两阶段设计避免频繁权重交换：
+`forward_rkfac_ode()` 采用**梯度检查点 + 交错评估**设计，同时保证正确梯度和内存效率：
 
 ```
-Phase 1: ODE with current weights (K suffix forwards)
-  for k in range(K):
-    u_theta_k = model(x_k, t_k)          # 有梯度
-    record (x_k, t_k) trajectory          # detach
-    x_{k+1} = x_k + u_theta_k * dt       # Euler step
+save current expert weights once
 
-Phase 2: Frozen expert velocities (K suffix forwards, weight swap)
-  save current expert weights
-  load frozen expert weights
-  for k in range(K):
-    u_pre_k = model(x_k, t_k)            # 无梯度
-  restore current expert weights
+for k in range(K):
+  # Current expert (gradient checkpointed — activations在backward时重算)
+  suffix_out = checkpoint(get_suffix_out, x, t_k)
+  u_theta_k = action_out_proj(suffix_out)    # 有梯度
 
-Phase 3: Compute E_res
-  E_res = Σ_k ½ ||u_theta_k - u_pre_k||² · dt_k
+  # Frozen expert (单步 weight swap, no_grad)
+  load frozen weights → forward → restore current weights
+  u_pre_k = frozen_model(x.detach(), t_k)   # 无梯度
+
+  # 立即计算 E_res 增量（不需要存完整 trajectory）
+  E_res += ½ ||u_theta_k - u_pre_k||² · dt
+
+  # Euler step (梯度穿过 ODE 链)
+  x = x + u_theta_k * dt
 ```
 
-**关键点**：权重交换只发生两次（load frozen + restore current），不是 2K 次。Phase 2 的所有 K 步共享同一次权重交换。
+**内存优化**：
+- **梯度检查点**: suffix forward 的中间激活在 forward 时丢弃，backward 时重算。K 步 ODE 从存 K× 激活降到 ~1× 激活，内存节省 ~(K-1)/K
+- **交错评估**: 每步立即算 frozen velocity 和 E_res 增量 → 无需存储完整 trajectory 列表
+- **权重交换**: save 一次 current weights，每步 swap-forward-restore。比两阶段设计多 K 次 swap 但避免 trajectory 存储
+- **显式 float32**: E_res 计算使用 `.float()` 避免 AMP autocast 精度损失
 
 ### 5.2 Frozen Expert Reference
 
@@ -186,7 +191,25 @@ Critic 先学好 Q 值估计，再用 Q 梯度指导 actor → 训练更稳定�
 
 `_preprocess_observation()` 返回的 `state`/`images` 可能在 CPU 上。`forward_rkfac_ode` 需要从 `forward_inputs`（已被 actor worker 移到 CUDA）获取正确的 device，而不是从 `state.device` 获取。
 
-### 5.8 Actor Q-evaluation 的 Batch Size
+### 5.8 CUDA OOM 解决方案
+
+`forward_rkfac_ode` 需要 1 VLM prefix + 2K suffix forwards（K current + K frozen）。原始实现将所有 K 步 current forward 的激活保留在内存（为 backward 所需），导致 80GB A100 OOM。
+
+**三重优化**：
+
+1. **`torch.utils.checkpoint.checkpoint`** — 每步 suffix forward 使用梯度检查点。Forward 时丢弃中间激活（attention KV、FFN outputs 等），backward 时重算。内存从 O(K) 降到 O(1)，代价是 ~2× 计算
+2. **交错评估** — 每步立即计算 frozen velocity + E_res 增量，无需存储 `u_theta_list`、`x_trajectory`、`t_trajectory` 列表
+3. **配置降低** — `micro_batch_size: 64→16`（4× 减少 per-step 激活），`num_ode_steps: 4→2`（2× 减少步数）
+
+**内存估算** (80GB A100, K=2, micro_batch=16):
+- 基础模型: ~8GB
+- VLM KV cache: ~5GB
+- Expert weight clone: ~3GB
+- 1× suffix forward 激活 (checkpointed): ~5-8GB
+- 其他: ~5GB
+- **Total ~30GB** — 安全余量 ~50GB
+
+### 5.9 Actor Q-evaluation 的 Batch Size
 
 Actor 更新时 ODE forward 处理完整 micro-batch（包含 padding 的 transition），而 critic 的 `vlm_emb_d` 经过 `rkfac_valid` 过滤后 batch size 更小。Actor 的 Q 评估应使用 `ode_result["vlm_embedding"]`（与 ODE 生成的动作 batch size 一致），不能用 critic 的 `vlm_emb_d`。
 
@@ -202,7 +225,7 @@ Actor 更新时 ODE forward 处理完整 micro-batch（包含 padding 的 transi
 | `rkfac_q_lr` | 1e-4 | Q-network 学习率 |
 | `rkfac_q_hidden_dims` | [512, 256, 128] | Q MLP 隐藏层维度 |
 | `rkfac_actor_delay` | 2 | Critic 更新 N 次后 actor 更新 1 次 |
-| `rkfac_num_ode_steps` | 4 | Actor update 时的 ODE 步数 K |
+| `rkfac_num_ode_steps` | 2 | Actor update 时的 ODE 步数 K（默认 2 省内存，可增至 4）|
 | `rkfac_grad_clip` | 1.0 | Q-network 梯度裁剪 |
 | `rkfac_vlm_hidden` | 2048 | VLM 嵌入维度 (PaliGemma 2B) |
 
@@ -211,7 +234,7 @@ Actor 更新时 ODE forward 处理完整 micro-batch（包含 padding 的 transi
 - `rkfac_alpha_init`: 如果初始 E_res 远大于 e_tgt → 减小 alpha_init；反之增大
 - `rkfac_q_lr`: Q 学习太快会导致过估计 → 减小；太慢导致 actor 信号弱 → 增大
 - `rkfac_actor_delay`: 增大到 4 或 8 可以让 Q 更稳定后再更新 actor
-- `rkfac_num_ode_steps`: 增大 K 提高 E_res 精度但增加计算量。4 是好的起点
+- `rkfac_num_ode_steps`: 增大 K 提高 E_res 精度但增加计算/内存。默认 2（梯度检查点下 80GB A100 安全）；4 需 micro_batch_size ≤ 8 或更大 GPU
 
 ## 7. 监控指标
 

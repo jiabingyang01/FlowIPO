@@ -1034,9 +1034,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         RK-FAC: 1 VLM prefix forward + K ODE steps through action expert.
         Simultaneously computes residual kinetic energy E_res using frozen expert.
 
-        Phase 1: Run ODE with current weights, recording trajectory.
-        Phase 2: Compute frozen expert velocities via weight swap.
-        Phase 3: Compute E_res from velocity differences.
+        Memory-efficient design:
+        - Gradient checkpointing: suffix forward activations are recomputed during
+          backward instead of stored, saving ~(K-1)x activation memory.
+        - Interleaved frozen evaluation: at each ODE step, the frozen expert velocity
+          is computed immediately via weight swap (no need to store full trajectory).
 
         Args:
             forward_inputs: Dict containing observation data.
@@ -1051,6 +1053,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
               e_res: [batch] — residual kinetic energy scalar
               vlm_embedding: [batch, hidden_dim] — pooled VLM features (for Q input)
         """
+        from torch.utils.checkpoint import checkpoint as ckpt_fn
+
         if observation is None:
             observation = self.input_transform(forward_inputs, transpose=False)
             observation = _model.Observation.from_dict(observation)
@@ -1089,113 +1093,85 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # Pool VLM embedding for Q-network input
         vlm_embedding = prefix_output.mean(dim=1).detach()  # [batch, hidden_dim]
 
-        # === Phase 1: ODE loop with current weights ===
+        # Free prefix tensors to reduce memory before ODE loop
+        del prefix_embs, prefix_att_masks, prefix_att_2d_masks
+        del prefix_position_ids, prefix_att_2d_masks_4d, prefix_output
+
+        # === Save current expert weights once (for restore after frozen forwards) ===
+        _saved_expert = self._save_action_expert_state()
+
+        # === ODE loop: gradient checkpointed current + interleaved frozen ===
         K = num_ode_steps
         schedule = torch.linspace(1, 0, K + 1, device=device)
 
         actions_shape = (batch_size, self.config.action_horizon, self.config.action_dim)
         x = torch.randn(actions_shape, device=device, dtype=torch.float32)
-
-        u_theta_list = []
-        x_trajectory = []
-        t_trajectory = []
-        dt_list = []
+        e_res = torch.zeros(batch_size, device=device)
 
         for k in range(K):
             t_k = schedule[k].expand(batch_size)
             dt = (schedule[k] - schedule[k + 1]).item()
 
-            x_trajectory.append(x.detach().clone())
-            t_trajectory.append(t_k.detach().clone())
-            dt_list.append(dt)
-
-            suffix_out = self.get_suffix_out(
+            # Current expert forward (gradient checkpointed to save memory).
+            # During backward, get_suffix_out is re-executed to recompute activations
+            # instead of storing them, saving ~(K-1)x activation memory.
+            suffix_out = ckpt_fn(
+                self.get_suffix_out,
                 state, prefix_pad_masks, past_key_values, x, t_k,
+                use_reentrant=False,
             )
             u_theta = self.action_out_proj(suffix_out)
-            u_theta_list.append(u_theta)
 
+            # Frozen expert forward: swap weights → forward (no grad) → restore.
+            # Done per-step to avoid storing full trajectory + weight clone memory.
+            self._load_action_expert_state(frozen_expert_state)
+            with torch.no_grad():
+                frozen_suffix = self.get_suffix_out(
+                    state, prefix_pad_masks, past_key_values,
+                    x.detach(), t_k.detach(),
+                )
+                u_pre = self.action_out_proj(frozen_suffix).detach()
+            self._load_action_expert_state(_saved_expert)
+            del frozen_suffix  # free immediately
+
+            # Accumulate residual kinetic energy: E_res += ½||u_θ - u_pre||² · dt
+            # Explicit float32 to avoid precision loss under AMP autocast
+            diff = u_theta.float() - u_pre.float()
+            e_res = e_res + 0.5 * (diff ** 2).sum(dim=-1).mean(dim=-1) * dt
+            del diff, u_pre  # free immediately
+
+            # Euler step (gradient flows through u_theta → ODE chain)
             x = x + u_theta * dt
 
-        actions = x  # [batch, action_horizon, action_dim]
-
-        # === Phase 2: Frozen expert velocities via weight swap ===
-        u_pre_list = self._frozen_expert_velocities(
-            state, prefix_pad_masks, past_key_values,
-            x_trajectory, t_trajectory, frozen_expert_state,
-        )
-
-        # === Phase 3: Residual kinetic energy ===
-        e_res = torch.zeros(batch_size, device=device)
-        for k in range(K):
-            diff = u_theta_list[k] - u_pre_list[k]
-            # sum over action dims, mean over horizon steps
-            e_res = e_res + 0.5 * (diff ** 2).sum(dim=-1).mean(dim=-1) * dt_list[k]
+        # Clean up saved weights
+        del _saved_expert
+        torch.cuda.empty_cache()
 
         return {
-            "actions": actions,
+            "actions": x,
             "e_res": e_res,
             "vlm_embedding": vlm_embedding,
         }
 
-    def _frozen_expert_velocities(
-        self,
-        state,
-        prefix_pad_masks,
-        past_key_values,
-        x_trajectory,
-        t_trajectory,
-        frozen_expert_state,
-    ):
-        """
-        Compute velocities at recorded trajectory points using frozen expert weights.
-        Uses weight-swap: save current -> load frozen -> forward -> restore current.
-
-        Args:
-            state, prefix_pad_masks, past_key_values: VLM context (shared).
-            x_trajectory: list of [batch, horizon, dim] detached trajectory points.
-            t_trajectory: list of [batch] detached timesteps.
-            frozen_expert_state: dict mapping full param names to frozen weight tensors.
-
-        Returns:
-            List of [batch, horizon, dim] frozen velocity tensors (detached).
-        """
-        # Save current expert + action_out_proj weights
-        current_state = {}
+    def _save_action_expert_state(self):
+        """Save current action expert + output projection weights for later restoration."""
+        state = {}
         for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
-            current_state[f"paligemma_with_expert.gemma_expert.{name}"] = param.data.clone()
+            state[f"paligemma_with_expert.gemma_expert.{name}"] = param.data.clone()
         for name, param in self.action_out_proj.named_parameters():
-            current_state[f"action_out_proj.{name}"] = param.data.clone()
+            state[f"action_out_proj.{name}"] = param.data.clone()
+        return state
 
-        # Load frozen weights
+    def _load_action_expert_state(self, state_dict):
+        """Load action expert + output projection weights from a state dict (in-place)."""
         for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
             key = f"paligemma_with_expert.gemma_expert.{name}"
-            if key in frozen_expert_state:
-                param.data.copy_(frozen_expert_state[key])
+            if key in state_dict:
+                param.data.copy_(state_dict[key])
         for name, param in self.action_out_proj.named_parameters():
             key = f"action_out_proj.{name}"
-            if key in frozen_expert_state:
-                param.data.copy_(frozen_expert_state[key])
-
-        # Forward with frozen weights (no gradients)
-        u_pre_list = []
-        with torch.no_grad():
-            for x_k, t_k in zip(x_trajectory, t_trajectory):
-                suffix_out = self.get_suffix_out(
-                    state, prefix_pad_masks, past_key_values, x_k, t_k,
-                )
-                u_pre = self.action_out_proj(suffix_out)
-                u_pre_list.append(u_pre.detach())
-
-        # Restore current weights
-        for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
-            key = f"paligemma_with_expert.gemma_expert.{name}"
-            param.data.copy_(current_state[key])
-        for name, param in self.action_out_proj.named_parameters():
-            key = f"action_out_proj.{name}"
-            param.data.copy_(current_state[key])
-
-        return u_pre_list
+            if key in state_dict:
+                param.data.copy_(state_dict[key])
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):

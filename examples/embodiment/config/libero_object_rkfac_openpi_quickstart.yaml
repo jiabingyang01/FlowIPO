@@ -59,7 +59,7 @@ algorithm:
   rkfac_q_lr: 1.0e-4                   # Q-network learning rate
   rkfac_q_hidden_dims: [512, 256, 128] # Q MLP hidden layers
   rkfac_actor_delay: 2                 # critic updates per actor update
-  rkfac_num_ode_steps: 4              # ODE steps K for actor update
+  rkfac_num_ode_steps: 2              # ODE steps K for actor update (2 saves memory; increase to 4 if GPU allows)
   rkfac_grad_clip: 1.0                 # gradient clipping for Q-network
   rkfac_vlm_hidden: 2048               # VLM embedding dimension (PaliGemma)
 
@@ -140,8 +140,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 64
-  global_batch_size: 512
+  micro_batch_size: 16                 # reduced from 64 for RK-FAC ODE memory (K suffix forwards per step)
+  global_batch_size: 256               # reduced accordingly to keep gradient accumulation reasonable
   seed: 42
   enable_offload: True
   model:
