@@ -22,3 +22,4 @@ PKG-INFO
 checkpoints/*
 logs/*
 *.tar
+tb.sh

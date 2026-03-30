@@ -2128,24 +2128,36 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             episode_rewards = rewards.sum(dim=(0, 2))
         episode_rewards = episode_rewards.clamp(0, 1)
 
+        # Helper: pad first dim from n_steps-1 to n_steps (zero-pad last row)
+        # Required because process_nested_dict_for_train expects all tensors
+        # to have the same first dim as prev_logprobs (n_steps).
+        def _pad_to_n(tensor):
+            pad = torch.zeros(1, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, pad], dim=0)
+
         # VLM embeddings: [n_steps, batch, hidden_dim]
         vlm_embs = forward_inputs.get("vlm_embedding", None)
         if vlm_embs is not None:
             if vlm_embs.dim() == 2:
                 hidden_dim = vlm_embs.shape[-1]
                 vlm_embs = vlm_embs.reshape(n_steps, batch_size, hidden_dim)
-            # Transition pairs for Q-learning
-            self.rollout_batch["rkfac_vlm_emb_cur"] = vlm_embs[:-1]    # [n-1, batch, hidden]
-            self.rollout_batch["rkfac_vlm_emb_next"] = vlm_embs[1:]   # [n-1, batch, hidden]
+            # Transition pairs for Q-learning, padded to [n_steps, ...]
+            self.rollout_batch["rkfac_vlm_emb_cur"] = _pad_to_n(vlm_embs[:-1])
+            self.rollout_batch["rkfac_vlm_emb_next"] = _pad_to_n(vlm_embs[1:])
 
         # Actions: [n_steps, batch, chunk, dim]
         actions = self.rollout_batch["actions"]
-        self.rollout_batch["rkfac_action_cur"] = actions[:-1]   # [n-1, batch, chunk, dim]
-        self.rollout_batch["rkfac_action_next"] = actions[1:]
+        self.rollout_batch["rkfac_action_cur"] = _pad_to_n(actions[:-1])
+        self.rollout_batch["rkfac_action_next"] = _pad_to_n(actions[1:])
 
-        # Per-step reward (sum over action chunk dim)
+        # Per-step reward (sum over action chunk dim), padded to [n_steps, batch]
         step_rewards = rewards[:-1].sum(dim=-1)  # [n-1, batch]
-        self.rollout_batch["rkfac_step_rewards"] = step_rewards
+        self.rollout_batch["rkfac_step_rewards"] = _pad_to_n(step_rewards)
+
+        # Valid transition mask: last row is padding
+        rkfac_valid = torch.ones(n_steps, batch_size, device=rewards.device)
+        rkfac_valid[-1] = 0.0
+        self.rollout_batch["rkfac_valid"] = rkfac_valid
 
         # Dummy advantages/prev_logprobs (RK-FAC doesn't use, but pipeline needs them)
         self.rollout_batch["advantages"] = torch.zeros(
@@ -2752,14 +2764,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         action_stored = batch.get("rkfac_action_cur", None)
                         action_next_stored = batch.get("rkfac_action_next", None)
                         step_reward = batch.get("rkfac_step_rewards", None)
+                        rkfac_valid = batch.get("rkfac_valid", None)
 
-                        # Handle case where transition data is not available
-                        # (e.g., last step in rollout produces no transitions)
+                        # Filter valid transitions (last row per rollout is zero-padded)
                         has_transitions = (
                             vlm_emb is not None and vlm_emb.numel() > 0
                             and action_stored is not None
                             and step_reward is not None
                         )
+                        if has_transitions and rkfac_valid is not None:
+                            valid_mask = rkfac_valid.bool()
+                            vlm_emb = vlm_emb[valid_mask]
+                            vlm_emb_next = vlm_emb_next[valid_mask]
+                            action_stored = action_stored[valid_mask]
+                            action_next_stored = action_next_stored[valid_mask]
+                            step_reward = step_reward[valid_mask]
+                            has_transitions = vlm_emb.shape[0] > 0
 
                         if has_transitions:
                             bsz = vlm_emb.shape[0]
