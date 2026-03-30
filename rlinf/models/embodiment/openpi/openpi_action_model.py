@@ -1058,7 +1058,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self._preprocess_observation(observation, train=False)
         )
 
-        device = state.device
+        # Get CUDA device from forward_inputs (already on GPU from actor worker).
+        # state from _preprocess_observation may be on CPU.
+        if "observation/state" in forward_inputs and isinstance(forward_inputs["observation/state"], torch.Tensor):
+            device = forward_inputs["observation/state"].device
+        else:
+            device = next(self.parameters()).device
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)

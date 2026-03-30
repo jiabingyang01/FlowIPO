@@ -182,6 +182,14 @@ Critic 先学好 Q 值估计，再用 Q 梯度指导 actor → 训练更稳定�
 
 解决方案：改用 out-of-place 除法 `loss = loss / gradient_accumulation`。
 
+### 5.7 Device 一致性
+
+`_preprocess_observation()` 返回的 `state`/`images` 可能在 CPU 上。`forward_rkfac_ode` 需要从 `forward_inputs`（已被 actor worker 移到 CUDA）获取正确的 device，而不是从 `state.device` 获取。
+
+### 5.8 Actor Q-evaluation 的 Batch Size
+
+Actor 更新时 ODE forward 处理完整 micro-batch（包含 padding 的 transition），而 critic 的 `vlm_emb_d` 经过 `rkfac_valid` 过滤后 batch size 更小。Actor 的 Q 评估应使用 `ode_result["vlm_embedding"]`（与 ODE 生成的动作 batch size 一致），不能用 critic 的 `vlm_emb_d`。
+
 ## 6. 超参数
 
 | 参数 | 默认值 | 说明 |

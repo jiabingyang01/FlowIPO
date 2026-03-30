@@ -2829,6 +2829,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                                 a_theta = ode_result["actions"]   # [batch, horizon, dim]
                                 e_res = ode_result["e_res"]       # [batch]
+                                # Use VLM embedding from ODE forward (same batch size as a_theta)
+                                vlm_emb_ode = ode_result["vlm_embedding"].float()
 
                                 # Flatten generated action for Q input
                                 a_theta_flat = a_theta[:, :action_chunk, :action_dim].reshape(
@@ -2837,7 +2839,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                                 # Actor loss = α·E_res - min Q(s, a_θ)
                                 q_for_actor = self._q_network(
-                                    vlm_emb_d[:a_theta.shape[0]], a_theta_flat,
+                                    vlm_emb_ode, a_theta_flat,
                                 )
                                 q_min = q_for_actor.min(dim=-1).values
                                 actor_loss_val = (alpha * e_res - q_min).mean()
