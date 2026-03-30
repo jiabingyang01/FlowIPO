@@ -2962,7 +2962,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
                         # ============ End Original Branch ============
 
-                    loss /= self.gradient_accumulation
+                    loss = loss / self.gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
 

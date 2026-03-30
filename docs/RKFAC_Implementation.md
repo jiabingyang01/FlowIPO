@@ -170,6 +170,18 @@ for each mini-batch:
 
 Critic 先学好 Q 值估计，再用 Q 梯度指导 actor → 训练更稳定。
 
+### 5.5 Transition Data Padding
+
+`process_nested_dict_for_train` 要求所有 tensor 第一维大小一致（`n_steps`）。但 RK-FAC 的 transition 对是 `(s_t, a_t, r_t, s_{t+1}, a_{t+1})`，只有 `n_steps - 1` 个。
+
+解决方案：credit assignment 中将 `[n_steps-1, ...]` 的 transition 数据 zero-pad 到 `[n_steps, ...]`，同时创建 `rkfac_valid` mask。训练时用 mask 过滤掉 padding 行。
+
+### 5.6 Zero Loss 的 Gradient Accumulation
+
+当 actor 不更新时（只更新 critic），`loss = torch.tensor(0.0, requires_grad=True)` 是 leaf variable。共享代码 `loss /= gradient_accumulation` 是 in-place 操作，PyTorch 禁止对 leaf 做 in-place 修改。
+
+解决方案：改用 out-of-place 除法 `loss = loss / gradient_accumulation`。
+
 ## 6. 超参数
 
 | 参数 | 默认值 | 说明 |
