@@ -51,9 +51,10 @@ algorithm:
   adv_type: gae                        # not used by RK-FAC, kept for compatibility
 
   # RK-FAC hyperparameters
-  rkfac_alpha_init: 0.1                # initial temperature α
+  rkfac_alpha_init: 1.0                # initial temperature α (large → strong regularization early)
   rkfac_alpha_lr: 3.0e-4               # α learning rate
-  rkfac_e_tgt: 1.0                     # target residual kinetic energy (C × d_a)
+  rkfac_e_tgt: 0.2                     # target residual kinetic energy (small → stay close to pretrained)
+  rkfac_critic_warmup_steps: 500       # Q-network warmup: only train critic for first N steps before actor updates
   rkfac_gamma: 0.99                    # TD discount factor
   rkfac_tau: 0.005                     # target Q-network EMA rate
   rkfac_q_lr: 1.0e-4                   # Q-network learning rate

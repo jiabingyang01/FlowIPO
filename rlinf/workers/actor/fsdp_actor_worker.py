@@ -1151,9 +1151,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             import copy as _copy
 
             self._rkfac_cfg = {
-                "alpha_init": self.cfg.algorithm.get("rkfac_alpha_init", 0.1),
+                "alpha_init": self.cfg.algorithm.get("rkfac_alpha_init", 1.0),
                 "alpha_lr": self.cfg.algorithm.get("rkfac_alpha_lr", 3e-4),
-                "e_tgt": self.cfg.algorithm.get("rkfac_e_tgt", 1.0),
+                "e_tgt": self.cfg.algorithm.get("rkfac_e_tgt", 0.2),
                 "gamma": self.cfg.algorithm.get("rkfac_gamma", 0.99),
                 "tau": self.cfg.algorithm.get("rkfac_tau", 0.005),
                 "q_lr": self.cfg.algorithm.get("rkfac_q_lr", 1e-4),
@@ -1161,6 +1161,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "actor_delay": self.cfg.algorithm.get("rkfac_actor_delay", 2),
                 "num_ode_steps": self.cfg.algorithm.get("rkfac_num_ode_steps", 4),
                 "grad_clip": self.cfg.algorithm.get("rkfac_grad_clip", 1.0),
+                "critic_warmup_steps": self.cfg.algorithm.get("rkfac_critic_warmup_steps", 500),
             }
             self._rkfac_update_count = 0
 
@@ -2812,12 +2813,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             )
                             self._q_optimizer.step()
 
-                            # === Actor Update (delayed) ===
+                            # === Actor Update (delayed, after critic warmup) ===
                             self._rkfac_update_count += 1
                             actor_loss_val = torch.tensor(0.0, device=self.device)
                             e_res_val = torch.tensor(0.0, device=self.device)
+                            critic_warmed_up = self._rkfac_update_count > cfg["critic_warmup_steps"]
 
-                            if self._rkfac_update_count % cfg["actor_delay"] == 0:
+                            if critic_warmed_up and self._rkfac_update_count % cfg["actor_delay"] == 0:
                                 # ODE forward: generate actions + compute E_res
                                 with self.amp_context:
                                     ode_result = self.model(
@@ -2874,6 +2876,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 "actor/q_mean": q_vals.mean().detach().item(),
                                 "actor/td_target_mean": td_target.mean().item(),
                                 "actor/total_loss": loss.detach().item(),
+                                "actor/critic_warmup": 0.0 if critic_warmed_up else 1.0,
                             }
                         else:
                             # No valid transitions in this micro-batch
