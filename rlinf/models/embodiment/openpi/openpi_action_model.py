@@ -267,6 +267,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.forward_value(**kwargs)
         elif forward_type == ForwardType.GFN_CHAIN:
             return self.forward_gfn_chain(**kwargs)
+        elif forward_type == ForwardType.RKFAC_ODE:
+            return self.forward_rkfac_ode(**kwargs)
         else:
             raise NotImplementedError
 
@@ -1020,6 +1022,175 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "log_flows": log_flows,
             "v_reg": v_reg,
         }
+
+    def forward_rkfac_ode(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        frozen_expert_state: dict[str, torch.Tensor],
+        num_ode_steps: int = 4,
+        observation=None,
+    ) -> dict[str, Any]:
+        """
+        RK-FAC: 1 VLM prefix forward + K ODE steps through action expert.
+        Simultaneously computes residual kinetic energy E_res using frozen expert.
+
+        Phase 1: Run ODE with current weights, recording trajectory.
+        Phase 2: Compute frozen expert velocities via weight swap.
+        Phase 3: Compute E_res from velocity differences.
+
+        Args:
+            forward_inputs: Dict containing observation data.
+            frozen_expert_state: Dict mapping param names to frozen pretrained weights
+                (keys relative to this model, e.g. 'paligemma_with_expert.gemma_expert...').
+            num_ode_steps: Number of Euler ODE steps K.
+            observation: Optional pre-processed Observation.
+
+        Returns:
+            Dict with:
+              actions: [batch, action_horizon, action_dim] — ODE-generated actions
+              e_res: [batch] — residual kinetic energy scalar
+              vlm_embedding: [batch, hidden_dim] — pooled VLM features (for Q input)
+        """
+        if observation is None:
+            observation = self.input_transform(forward_inputs, transpose=False)
+            observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        device = state.device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+        batch_size = state.shape[0]
+
+        # === VLM prefix forward (expensive, done ONCE) ===
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Pool VLM embedding for Q-network input
+        vlm_embedding = prefix_output.mean(dim=1).detach()  # [batch, hidden_dim]
+
+        # === Phase 1: ODE loop with current weights ===
+        K = num_ode_steps
+        schedule = torch.linspace(1, 0, K + 1, device=device)
+
+        actions_shape = (batch_size, self.config.action_horizon, self.config.action_dim)
+        x = torch.randn(actions_shape, device=device, dtype=torch.float32)
+
+        u_theta_list = []
+        x_trajectory = []
+        t_trajectory = []
+        dt_list = []
+
+        for k in range(K):
+            t_k = schedule[k].expand(batch_size)
+            dt = (schedule[k] - schedule[k + 1]).item()
+
+            x_trajectory.append(x.detach().clone())
+            t_trajectory.append(t_k.detach().clone())
+            dt_list.append(dt)
+
+            suffix_out = self.get_suffix_out(
+                state, prefix_pad_masks, past_key_values, x, t_k,
+            )
+            u_theta = self.action_out_proj(suffix_out)
+            u_theta_list.append(u_theta)
+
+            x = x + u_theta * dt
+
+        actions = x  # [batch, action_horizon, action_dim]
+
+        # === Phase 2: Frozen expert velocities via weight swap ===
+        u_pre_list = self._frozen_expert_velocities(
+            state, prefix_pad_masks, past_key_values,
+            x_trajectory, t_trajectory, frozen_expert_state,
+        )
+
+        # === Phase 3: Residual kinetic energy ===
+        e_res = torch.zeros(batch_size, device=device)
+        for k in range(K):
+            diff = u_theta_list[k] - u_pre_list[k]
+            # sum over action dims, mean over horizon steps
+            e_res = e_res + 0.5 * (diff ** 2).sum(dim=-1).mean(dim=-1) * dt_list[k]
+
+        return {
+            "actions": actions,
+            "e_res": e_res,
+            "vlm_embedding": vlm_embedding,
+        }
+
+    def _frozen_expert_velocities(
+        self,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        x_trajectory,
+        t_trajectory,
+        frozen_expert_state,
+    ):
+        """
+        Compute velocities at recorded trajectory points using frozen expert weights.
+        Uses weight-swap: save current -> load frozen -> forward -> restore current.
+
+        Args:
+            state, prefix_pad_masks, past_key_values: VLM context (shared).
+            x_trajectory: list of [batch, horizon, dim] detached trajectory points.
+            t_trajectory: list of [batch] detached timesteps.
+            frozen_expert_state: dict mapping full param names to frozen weight tensors.
+
+        Returns:
+            List of [batch, horizon, dim] frozen velocity tensors (detached).
+        """
+        # Save current expert + action_out_proj weights
+        current_state = {}
+        for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
+            current_state[f"paligemma_with_expert.gemma_expert.{name}"] = param.data.clone()
+        for name, param in self.action_out_proj.named_parameters():
+            current_state[f"action_out_proj.{name}"] = param.data.clone()
+
+        # Load frozen weights
+        for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
+            key = f"paligemma_with_expert.gemma_expert.{name}"
+            if key in frozen_expert_state:
+                param.data.copy_(frozen_expert_state[key])
+        for name, param in self.action_out_proj.named_parameters():
+            key = f"action_out_proj.{name}"
+            if key in frozen_expert_state:
+                param.data.copy_(frozen_expert_state[key])
+
+        # Forward with frozen weights (no gradients)
+        u_pre_list = []
+        with torch.no_grad():
+            for x_k, t_k in zip(x_trajectory, t_trajectory):
+                suffix_out = self.get_suffix_out(
+                    state, prefix_pad_masks, past_key_values, x_k, t_k,
+                )
+                u_pre = self.action_out_proj(suffix_out)
+                u_pre_list.append(u_pre.detach())
+
+        # Restore current weights
+        for name, param in self.paligemma_with_expert.gemma_expert.named_parameters():
+            key = f"paligemma_with_expert.gemma_expert.{name}"
+            param.data.copy_(current_state[key])
+        for name, param in self.action_out_proj.named_parameters():
+            key = f"action_out_proj.{name}"
+            param.data.copy_(current_state[key])
+
+        return u_pre_list
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):

@@ -1198,3 +1198,47 @@ def compute_flow_fpi_loss(
         "actor/fpi_weight_max": weights.detach().max().item(),
     }
     return loss, metrics_data
+
+
+def compute_residual_kinetic_energy(
+    u_theta_list: list[torch.Tensor],
+    u_pre_list: list[torch.Tensor],
+    dt_list: list[float],
+) -> torch.Tensor:
+    """
+    Compute residual kinetic energy E_res = Σ_k ½ ||u_θ_k - u_pre_k||² · dt_k.
+
+    This is the path-space deviation measure from the pretrained policy.
+    By Girsanov theorem, D_KL(P_θ || P_pre) = E_res / σ² (exact, not a bound).
+
+    Args:
+        u_theta_list: List of [batch, horizon, dim] current policy velocities at each ODE step.
+        u_pre_list: List of [batch, horizon, dim] pretrained policy velocities (detached).
+        dt_list: List of scalar time step sizes for each ODE step.
+
+    Returns:
+        e_res: [batch] residual kinetic energy per sample.
+    """
+    e_res = torch.zeros(u_theta_list[0].shape[0], device=u_theta_list[0].device)
+    for u_theta, u_pre, dt in zip(u_theta_list, u_pre_list, dt_list):
+        diff = u_theta - u_pre.detach()
+        # sum over action dims, mean over horizon steps
+        e_res = e_res + 0.5 * (diff ** 2).sum(dim=-1).mean(dim=-1) * dt
+    return e_res
+
+
+@register_policy_loss("flow_rkfac")
+def compute_flow_rkfac_loss(
+    actor_loss: torch.Tensor = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    RK-FAC loss placeholder — actual loss is computed directly in actor worker
+    (Q update + actor update with E_res and Q gradient through ODE).
+
+    This registered entry just passes through the pre-computed actor loss
+    so the registry dispatch system works correctly.
+    """
+    if actor_loss is None:
+        actor_loss = torch.tensor(0.0)
+    return actor_loss, {}

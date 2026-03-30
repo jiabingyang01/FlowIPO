@@ -1144,6 +1144,72 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "fea_ridge_lambda": self.cfg.algorithm.get("flow_hinge_nft_fea_ridge_lambda", 1.0),
             }
 
+        # RK-FAC: Residual-Kinetic Flow Actor-Critic
+        # Off-policy actor-critic with residual kinetic energy trust region + frozen-VLM Q-network
+        self._is_flow_rkfac = self.cfg.algorithm.loss_type == "flow_rkfac"
+        if self._is_flow_rkfac:
+            import copy as _copy
+
+            self._rkfac_cfg = {
+                "alpha_init": self.cfg.algorithm.get("rkfac_alpha_init", 0.1),
+                "alpha_lr": self.cfg.algorithm.get("rkfac_alpha_lr", 3e-4),
+                "e_tgt": self.cfg.algorithm.get("rkfac_e_tgt", 1.0),
+                "gamma": self.cfg.algorithm.get("rkfac_gamma", 0.99),
+                "tau": self.cfg.algorithm.get("rkfac_tau", 0.005),
+                "q_lr": self.cfg.algorithm.get("rkfac_q_lr", 1e-4),
+                "q_hidden_dims": self.cfg.algorithm.get("rkfac_q_hidden_dims", [512, 256, 128]),
+                "actor_delay": self.cfg.algorithm.get("rkfac_actor_delay", 2),
+                "num_ode_steps": self.cfg.algorithm.get("rkfac_num_ode_steps", 4),
+                "grad_clip": self.cfg.algorithm.get("rkfac_grad_clip", 1.0),
+            }
+            self._rkfac_update_count = 0
+
+            # Q-network (double-Q)
+            from rlinf.models.embodiment.modules.q_head import MultiQHead
+
+            # VLM hidden dim: PaliGemma uses 2048
+            vlm_hidden = self.cfg.algorithm.get("rkfac_vlm_hidden", 2048)
+            action_chunk = self.cfg.actor.model.get("action_chunk", 5)
+            action_env_dim = self.cfg.actor.model.get("action_dim", 7)
+            q_action_dim = action_chunk * action_env_dim
+
+            self._q_network = MultiQHead(
+                hidden_size=vlm_hidden,
+                action_feature_dim=q_action_dim,
+                hidden_dims=self._rkfac_cfg["q_hidden_dims"],
+                num_q_heads=2,
+            ).to(self.device)
+
+            # Target Q-network (soft EMA)
+            self._q_target = _copy.deepcopy(self._q_network)
+            self._q_target.eval()
+            for p in self._q_target.parameters():
+                p.requires_grad_(False)
+
+            # Q optimizer
+            self._q_optimizer = torch.optim.AdamW(
+                self._q_network.parameters(),
+                lr=self._rkfac_cfg["q_lr"],
+                weight_decay=1e-2,
+            )
+
+            # Learnable alpha (temperature)
+            self._log_alpha = torch.tensor(
+                [float(np.log(self._rkfac_cfg["alpha_init"]))],
+                requires_grad=True, device=self.device,
+            )
+            self._alpha_optimizer = torch.optim.Adam(
+                [self._log_alpha], lr=self._rkfac_cfg["alpha_lr"],
+            )
+
+            # Frozen reference expert: save initial action expert + output proj weights
+            # These are keyed relative to the unwrapped model (without FSDP prefixes)
+            self._frozen_expert_state = {}
+            unwrapped = self.model.module if hasattr(self.model, 'module') else self.model
+            for name, param in unwrapped.named_parameters():
+                if 'expert' in name or 'action_out' in name:
+                    self._frozen_expert_state[name] = param.data.detach().clone()
+
         # VP-PPO: VLM-Potential Reward Shaping (works WITH standard PPO, not a separate loss_type)
         self._use_vp_ppo = self.cfg.algorithm.get("use_vp_ppo", False)
         if self._use_vp_ppo:
@@ -1316,6 +1382,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return self._compute_flow_nft_credit_assignment()
         if self._is_flow_hinge_nft:
             return self._compute_flow_hinge_nft_credit_assignment()
+        if self._is_flow_rkfac:
+            return self._compute_flow_rkfac_credit_assignment()
 
         # VP-PPO: apply PBRS reward shaping before GAE (modifies rewards in-place)
         if self._use_vp_ppo:
@@ -2039,6 +2107,60 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             rollout_metrics["hinge_nft/y_abs_mean"] = advantages.abs().mean().item() / max(adv_clip, 1e-8)
         return rollout_metrics
 
+    def _compute_flow_rkfac_credit_assignment(self) -> dict:
+        """
+        RK-FAC credit assignment: build transition data for Q-learning.
+
+        RK-FAC doesn't need traditional advantages — the Q-network provides
+        per-step temporal credit via TD bootstrap. This method constructs
+        (s_t, a_t, r_t, s_{t+1}, a_{t+1}) transitions from rollout data.
+        """
+        rewards = self.rollout_batch["rewards"]  # [n_steps, batch, chunk]
+        forward_inputs = self.rollout_batch.get("forward_inputs", {})
+        n_steps = rewards.shape[0]
+        batch_size = rewards.shape[1]
+
+        # Episode-level reward for metrics
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            episode_rewards = (rewards * loss_mask).sum(dim=(0, 2))
+        else:
+            episode_rewards = rewards.sum(dim=(0, 2))
+        episode_rewards = episode_rewards.clamp(0, 1)
+
+        # VLM embeddings: [n_steps, batch, hidden_dim]
+        vlm_embs = forward_inputs.get("vlm_embedding", None)
+        if vlm_embs is not None:
+            if vlm_embs.dim() == 2:
+                hidden_dim = vlm_embs.shape[-1]
+                vlm_embs = vlm_embs.reshape(n_steps, batch_size, hidden_dim)
+            # Transition pairs for Q-learning
+            self.rollout_batch["rkfac_vlm_emb_cur"] = vlm_embs[:-1]    # [n-1, batch, hidden]
+            self.rollout_batch["rkfac_vlm_emb_next"] = vlm_embs[1:]   # [n-1, batch, hidden]
+
+        # Actions: [n_steps, batch, chunk, dim]
+        actions = self.rollout_batch["actions"]
+        self.rollout_batch["rkfac_action_cur"] = actions[:-1]   # [n-1, batch, chunk, dim]
+        self.rollout_batch["rkfac_action_next"] = actions[1:]
+
+        # Per-step reward (sum over action chunk dim)
+        step_rewards = rewards[:-1].sum(dim=-1)  # [n-1, batch]
+        self.rollout_batch["rkfac_step_rewards"] = step_rewards
+
+        # Dummy advantages/prev_logprobs (RK-FAC doesn't use, but pipeline needs them)
+        self.rollout_batch["advantages"] = torch.zeros(
+            n_steps, batch_size, device=rewards.device,
+        )
+        if "prev_logprobs" not in self.rollout_batch:
+            self.rollout_batch["prev_logprobs"] = torch.zeros(n_steps, batch_size, 1)
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        success_rate = (episode_rewards > 0.5).float().mean()
+        rollout_metrics["rkfac/episode_reward_mean"] = episode_rewards.mean().item()
+        rollout_metrics["rkfac/success_rate"] = success_rate.item()
+        rollout_metrics["rkfac/n_transitions"] = float((n_steps - 1) * batch_size)
+        return rollout_metrics
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -2614,6 +2736,128 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         }
                         loss, metrics_data = policy_loss(**loss_kwargs)
                         # ============ End FlowHingeNFT Branch ============
+                    elif self._is_flow_rkfac:
+                        # ============ RK-FAC Training Branch ============
+                        # Actor-Critic with residual kinetic energy trust region
+                        # Q-network learns value, actor optimizes Q - α·E_res
+                        cfg = self._rkfac_cfg
+                        alpha = self._log_alpha.exp().detach()
+
+                        action_chunk = self.cfg.actor.model.get("action_chunk", 5)
+                        action_dim = self.cfg.actor.model.get("action_dim", 7)
+
+                        # Extract transition data
+                        vlm_emb = batch.get("rkfac_vlm_emb_cur", None)
+                        vlm_emb_next = batch.get("rkfac_vlm_emb_next", None)
+                        action_stored = batch.get("rkfac_action_cur", None)
+                        action_next_stored = batch.get("rkfac_action_next", None)
+                        step_reward = batch.get("rkfac_step_rewards", None)
+
+                        # Handle case where transition data is not available
+                        # (e.g., last step in rollout produces no transitions)
+                        has_transitions = (
+                            vlm_emb is not None and vlm_emb.numel() > 0
+                            and action_stored is not None
+                            and step_reward is not None
+                        )
+
+                        if has_transitions:
+                            bsz = vlm_emb.shape[0]
+
+                            # Flatten actions: [batch, chunk, dim] -> [batch, chunk*dim]
+                            action_flat = action_stored[:, :action_chunk, :action_dim].reshape(bsz, -1)
+                            action_next_flat = action_next_stored[:, :action_chunk, :action_dim].reshape(bsz, -1)
+                            vlm_emb_d = vlm_emb.detach().float()
+                            vlm_emb_next_d = vlm_emb_next.detach().float()
+                            action_flat_d = action_flat.detach().float()
+                            action_next_flat_d = action_next_flat.detach().float()
+
+                            # === Critic Update ===
+                            with torch.no_grad():
+                                q_target_vals = self._q_target(
+                                    vlm_emb_next_d, action_next_flat_d,
+                                )  # [batch, 2]
+                                q_target_min = q_target_vals.min(dim=-1).values
+                                td_target = step_reward.float() + cfg["gamma"] * q_target_min
+
+                            q_vals = self._q_network(vlm_emb_d, action_flat_d)  # [batch, 2]
+                            q_loss = 0.5 * (
+                                (q_vals - td_target.unsqueeze(-1).expand_as(q_vals)) ** 2
+                            ).mean()
+
+                            self._q_optimizer.zero_grad()
+                            q_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(
+                                self._q_network.parameters(), cfg["grad_clip"],
+                            )
+                            self._q_optimizer.step()
+
+                            # === Actor Update (delayed) ===
+                            self._rkfac_update_count += 1
+                            actor_loss_val = torch.tensor(0.0, device=self.device)
+                            e_res_val = torch.tensor(0.0, device=self.device)
+
+                            if self._rkfac_update_count % cfg["actor_delay"] == 0:
+                                # ODE forward: generate actions + compute E_res
+                                with self.amp_context:
+                                    ode_result = self.model(
+                                        forward_type=ForwardType.RKFAC_ODE,
+                                        forward_inputs=forward_inputs,
+                                        frozen_expert_state=self._frozen_expert_state,
+                                        num_ode_steps=cfg["num_ode_steps"],
+                                    )
+
+                                a_theta = ode_result["actions"]   # [batch, horizon, dim]
+                                e_res = ode_result["e_res"]       # [batch]
+
+                                # Flatten generated action for Q input
+                                a_theta_flat = a_theta[:, :action_chunk, :action_dim].reshape(
+                                    a_theta.shape[0], -1,
+                                ).float()
+
+                                # Actor loss = α·E_res - min Q(s, a_θ)
+                                q_for_actor = self._q_network(
+                                    vlm_emb_d[:a_theta.shape[0]], a_theta_flat,
+                                )
+                                q_min = q_for_actor.min(dim=-1).values
+                                actor_loss_val = (alpha * e_res - q_min).mean()
+                                e_res_val = e_res.mean()
+
+                                loss = actor_loss_val
+
+                                # Alpha (temperature) update
+                                alpha_loss = -(
+                                    self._log_alpha * (cfg["e_tgt"] - e_res.detach().mean())
+                                ).mean()
+                                self._alpha_optimizer.zero_grad()
+                                alpha_loss.backward()
+                                self._alpha_optimizer.step()
+                            else:
+                                # Only critic updated this step, no actor grad
+                                loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+                            # Target network soft update
+                            with torch.no_grad():
+                                for p_tgt, p in zip(
+                                    self._q_target.parameters(),
+                                    self._q_network.parameters(),
+                                ):
+                                    p_tgt.data.mul_(1 - cfg["tau"]).add_(p.data, alpha=cfg["tau"])
+
+                            metrics_data = {
+                                "actor/q_loss": q_loss.detach().item(),
+                                "actor/actor_loss": actor_loss_val.detach().item(),
+                                "actor/e_res": e_res_val.detach().item(),
+                                "actor/alpha": alpha.item(),
+                                "actor/q_mean": q_vals.mean().detach().item(),
+                                "actor/td_target_mean": td_target.mean().item(),
+                                "actor/total_loss": loss.detach().item(),
+                            }
+                        else:
+                            # No valid transitions in this micro-batch
+                            loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                            metrics_data = {"actor/total_loss": 0.0}
+                        # ============ End RK-FAC Branch ============
                     else:
                         # ============ Original PPO/GRPO Branch ============
                         advantages = batch["advantages"]

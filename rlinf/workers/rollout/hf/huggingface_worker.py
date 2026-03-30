@@ -82,8 +82,9 @@ class MultiStepRolloutWorker(Worker):
         self._is_flow_gfn = _loss_type == "flow_gfn"
         self._is_flow_nft = _loss_type == "flow_nft"
         self._is_flow_hinge_nft = _loss_type == "flow_hinge_nft"
-        # NFT/Hinge-NFT do NOT need EMA ref model — all data comes from rollout SDE chain
-        # Hinge-NFT uses VLM embedding change rate for credit (zero cost, no EMA)
+        self._is_flow_rkfac = _loss_type == "flow_rkfac"
+        # NFT/Hinge-NFT/RK-FAC do NOT need EMA ref model
+        # RK-FAC uses frozen initial weights maintained in actor worker (not EMA)
         self._needs_ema_ref = self._is_flow_ipo or self._is_flow_sar or self._is_flow_fpi or self._is_flow_awm or self._is_flow_gfn
         if self._needs_ema_ref:
             self._ref_weights_cpu = None
@@ -124,8 +125,8 @@ class MultiStepRolloutWorker(Worker):
             # NFT / Hinge-NFT: enable snapshot collection in sample_actions
             if self._is_flow_nft or self._is_flow_hinge_nft:
                 rollout_model_config.openpi.use_nft_loss = True
-            # VP-PPO: enable VLM embedding collection for PBRS reward shaping
-            if self.cfg.algorithm.get("use_vp_ppo", False):
+            # VP-PPO / RK-FAC: enable VLM embedding collection
+            if self.cfg.algorithm.get("use_vp_ppo", False) or self._is_flow_rkfac:
                 rollout_model_config.openpi.collect_vlm_embedding = True
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)

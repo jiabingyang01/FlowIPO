@@ -82,7 +82,7 @@ def policy_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     loss_fn = get_policy_loss(loss_type)
 
     # FlowIPO/FlowSAR use their own forward paths, skip logprob preprocessing
-    if loss_type in ("flow_ipo", "flow_sar", "flow_fpi", "flow_awm", "flow_gfn", "flow_nft", "flow_hinge_nft"):
+    if loss_type in ("flow_ipo", "flow_sar", "flow_fpi", "flow_awm", "flow_gfn", "flow_nft", "flow_hinge_nft", "flow_rkfac"):
         loss, metrics_data = loss_fn(**kwargs)
         return loss, metrics_data
 

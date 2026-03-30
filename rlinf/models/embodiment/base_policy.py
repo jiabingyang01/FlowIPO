@@ -26,6 +26,7 @@ class ForwardType(Enum):
     VELOCITY = "velocity"  # FlowIPO: velocity prediction through FSDP forward()
     VALUE = "value"        # FPI: observation encoding + value head only (no ODE/velocity)
     GFN_CHAIN = "gfn_chain"  # GFN-Flow: 1 VLM prefix + K suffix forwards for denoising chain
+    RKFAC_ODE = "rkfac_ode"  # RK-FAC: 1 VLM prefix + K suffix ODE + E_res computation
 
 
 class BasePolicy(ABC):
