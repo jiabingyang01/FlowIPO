@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import time
 from functools import partial
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -88,7 +91,7 @@ from rlinf.utils.utils import (
     retrieve_model_state_dict_in_cpu,
 )
 from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
-from rlinf.algorithms.credit_assignment import compute_flow_ipo_weights, compute_flow_sar_weights, compute_flow_fpi_weights, compute_flow_awm_advantages, compute_flow_awm_exp_weights, compute_gfn_log_pf, compute_gfn_log_pb, compute_terminal_binary_advantages, compute_frozen_embedding_advantages
+from rlinf.algorithms.credit_assignment import compute_flow_ipo_weights, compute_flow_sar_weights, compute_flow_fpi_weights, compute_flow_awm_advantages, compute_flow_awm_exp_weights, compute_gfn_log_pf, compute_gfn_log_pb, compute_terminal_binary_advantages, compute_frozen_embedding_advantages, compute_deco_advantages
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.workers.rollout.utils import RankMapper
 
@@ -1124,6 +1127,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "value_coeff": self.cfg.algorithm.get("flow_nft_value_coeff", 0.5),
                 "gae_gamma": self.cfg.algorithm.get("gamma", 0.99),
                 "gae_lambda": self.cfg.algorithm.get("gae_lambda", 0.95),
+                # DECO: deviation-enhanced contrastive optimization
+                "deco_eta": self.cfg.algorithm.get("flow_nft_deco_eta", 2.0),
             }
 
         # Hinge-NFT: symmetric hinge margin loss variant of NFT
@@ -1210,6 +1215,57 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             for name, param in unwrapped.named_parameters():
                 if 'expert' in name or 'action_out' in name:
                     self._frozen_expert_state[name] = param.data.detach().clone()
+
+        # QGFM: Q-Guided Flow Matching
+        # Q-gradient perturbs flow matching target action: a' = a + η·∇_a Q / ||∇_a Q||
+        # Then standard FM loss: ||v_θ(x_t, t|s) - (ε - a')||²
+        self._is_flow_qgfm = self.cfg.algorithm.loss_type == "flow_qgfm"
+        if self._is_flow_qgfm:
+            import copy as _copy
+
+            self._qgfm_cfg = {
+                "eta_init": self.cfg.algorithm.get("qgfm_eta_init", 0.0001),
+                "eta_max": self.cfg.algorithm.get("qgfm_eta_max", 0.005),
+                "eta_warmup_iters": self.cfg.algorithm.get("qgfm_eta_warmup_iters", 200),
+                "q_warmup_iters": self.cfg.algorithm.get("qgfm_q_warmup_iters", 200),
+                "gamma": self.cfg.algorithm.get("qgfm_gamma", 0.99),
+                "tau": self.cfg.algorithm.get("qgfm_tau", 0.005),
+                "q_lr": self.cfg.algorithm.get("qgfm_q_lr", 1e-4),
+                "q_hidden_dims": self.cfg.algorithm.get("qgfm_q_hidden_dims", [512, 256, 128]),
+                "actor_delay": self.cfg.algorithm.get("qgfm_actor_delay", 1),
+                "grad_clip": self.cfg.algorithm.get("qgfm_grad_clip", 1.0),
+                "norm_q_grad": self.cfg.algorithm.get("qgfm_norm_q_grad", True),
+                "lam_bc": self.cfg.algorithm.get("qgfm_lam_bc", 0.5),
+            }
+            self._qgfm_update_count = 0
+
+            # Q-network (double-Q)
+            from rlinf.models.embodiment.modules.q_head import MultiQHead
+
+            vlm_hidden = self.cfg.algorithm.get("qgfm_vlm_hidden", 2048)
+            action_chunk = self.cfg.actor.model.get("action_chunk", 5)
+            action_env_dim = self.cfg.actor.model.get("action_dim", 7)
+            q_action_dim = action_chunk * action_env_dim
+
+            self._q_network = MultiQHead(
+                hidden_size=vlm_hidden,
+                action_feature_dim=q_action_dim,
+                hidden_dims=self._qgfm_cfg["q_hidden_dims"],
+                num_q_heads=2,
+            ).to(self.device)
+
+            # Target Q-network (soft EMA)
+            self._q_target = _copy.deepcopy(self._q_network)
+            self._q_target.eval()
+            for p in self._q_target.parameters():
+                p.requires_grad_(False)
+
+            # Q optimizer
+            self._q_optimizer = torch.optim.AdamW(
+                self._q_network.parameters(),
+                lr=self._qgfm_cfg["q_lr"],
+                weight_decay=1e-2,
+            )
 
         # VP-PPO: VLM-Potential Reward Shaping (works WITH standard PPO, not a separate loss_type)
         self._use_vp_ppo = self.cfg.algorithm.get("use_vp_ppo", False)
@@ -1385,6 +1441,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return self._compute_flow_hinge_nft_credit_assignment()
         if self._is_flow_rkfac:
             return self._compute_flow_rkfac_credit_assignment()
+        if self._is_flow_qgfm:
+            return self._compute_flow_qgfm_credit_assignment()
 
         # VP-PPO: apply PBRS reward shaping before GAE (modifies rewards in-place)
         if self._use_vp_ppo:
@@ -1944,10 +2002,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     n_steps=n_steps,
                     adv_clip_max=adv_clip,
                 )
+        elif adv_type == "deco":
+            # DECO: Deviation-Enhanced Contrastive Optimization
+            # Uses frozen reference model deviation as step-level importance weight.
+            ref_devs = forward_inputs.get("deco_ref_deviation", None)
+            if ref_devs is not None and ref_devs.dim() >= 1:
+                # Reshape to [n_steps, batch]
+                if ref_devs.dim() == 2:
+                    ref_devs_2d = ref_devs
+                else:
+                    ref_devs_2d = ref_devs.reshape(n_steps, batch_size)
+                eta = self._flow_nft_cfg["deco_eta"]
+                advantages, deco_metrics = compute_deco_advantages(
+                    episode_rewards=episode_rewards,
+                    ref_deviations=ref_devs_2d,
+                    n_steps=n_steps,
+                    adv_clip_max=adv_clip,
+                    eta=eta,
+                )  # [n_steps, batch]
+                self._deco_metrics = deco_metrics
+            else:
+                # Fallback to terminal binary if ref deviations not available
+                advantages = compute_terminal_binary_advantages(
+                    rewards=episode_rewards,
+                    n_steps=n_steps,
+                    adv_clip_max=adv_clip,
+                )
+                self._deco_metrics = {}
         elif adv_type == "gae":
-            # AG-NFT: GAE-based per-step credit assignment via value network
-            # Uses standard GAE with V(o,l) from VLM value head.
-            # Softplus naturally gates noisy labels: |y| ≈ 0 → gradient ≈ 0.
+            # AG-NFT: Blended terminal binary + GAE per-step credit assignment.
+            # α = corr(V_mean, episode_reward): auto-adapts to value network quality.
+            # V bad (α≈0) → pure terminal binary (StepNFT speed)
+            # V good (α≈1) → pure GAE (PPO-level precision)
             prev_values = self.rollout_batch.get("prev_values", None)
             dones = self.rollout_batch.get("dones", None)
             gamma = self._flow_nft_cfg["gae_gamma"]
@@ -1989,14 +2075,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 dones=dones_flat,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
-                normalize_advantages=False,  # AG-NFT uses adv_clip_max mapping
+                normalize_advantages=False,
                 normalize_returns=False,
             )  # gae_advantages: [n_steps, batch], gae_returns: [n_steps, batch]
 
-            # Clip to [-adv_clip, adv_clip] for NFT label mapping
-            advantages = gae_advantages.clamp(-adv_clip, adv_clip)  # [n_steps, batch]
+            # Compute terminal binary as baseline
+            terminal_adv = compute_terminal_binary_advantages(
+                rewards=episode_rewards,
+                n_steps=n_steps,
+                adv_clip_max=adv_clip,
+            )  # [n_steps, batch], all ±adv_clip
+
+            # Adaptive blending coefficient α = corr(V_mean, episode_reward)
+            # Measures how well V predicts success/failure
+            V_mean_per_episode = V_full[:n_steps].mean(dim=0)  # [batch]
+            if batch_size > 2 and V_mean_per_episode.std() > 1e-8:
+                # Pearson correlation between V predictions and outcomes
+                v_centered = V_mean_per_episode - V_mean_per_episode.mean()
+                r_centered = episode_rewards - episode_rewards.mean()
+                corr_num = (v_centered * r_centered).sum()
+                corr_den = (v_centered.norm() * r_centered.norm()).clamp(min=1e-8)
+                alpha = (corr_num / corr_den).clamp(0.0, 1.0).item()
+            else:
+                alpha = 0.0  # Not enough data or V is constant → pure terminal binary
+
+            # Blend: (1-α) * terminal_binary + α * gae
+            gae_clipped = gae_advantages.clamp(-adv_clip, adv_clip)
+            advantages = (1.0 - alpha) * terminal_adv + alpha * gae_clipped
+
             # Store returns for value training during actor update
             self.rollout_batch["agnft_returns"] = gae_returns
+            # Store alpha for metrics
+            self._agnft_alpha = alpha
         else:
             # Terminal binary: +1 success, -1 failure
             advantages = compute_terminal_binary_advantages(
@@ -2014,7 +2124,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics["nft/episode_reward"] = episode_rewards.mean().item()
         rollout_metrics["nft/success_rate"] = (episode_rewards > 0.5).float().mean().item()
         rollout_metrics["nft/adv_type"] = (
-            2.0 if adv_type == "gae"
+            3.0 if adv_type == "deco"
+            else 2.0 if adv_type == "gae"
             else 1.0 if adv_type == "frozen_embedding"
             else 0.0
         )
@@ -2022,14 +2133,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics["nft/adv_std"] = advantages.std().item()
         rollout_metrics["nft/pos_frac"] = (advantages > 0).float().mean().item()
 
+        # DECO diagnostics
+        if adv_type == "deco" and hasattr(self, "_deco_metrics"):
+            rollout_metrics.update(self._deco_metrics)
+
         # AG-NFT diagnostics
         if adv_type == "gae":
+            rollout_metrics["agnft/alpha"] = self._agnft_alpha  # blending coefficient
             rollout_metrics["agnft/raw_gae_adv_mean"] = gae_advantages.mean().item()
             rollout_metrics["agnft/raw_gae_adv_std"] = gae_advantages.std().item()
             rollout_metrics["agnft/returns_mean"] = gae_returns.mean().item()
             rollout_metrics["agnft/v_mean"] = V_full[:n_steps].mean().item()
             rollout_metrics["agnft/v_std"] = V_full[:n_steps].std().item()
-            # Self-calibration diagnostic: y = advantages / adv_clip maps to [-1, 1]
+            rollout_metrics["agnft/terminal_adv_mean"] = terminal_adv.mean().item()
+            # Blended label diagnostics
             y_labels = advantages / adv_clip
             rollout_metrics["agnft/y_near_zero_frac"] = (y_labels.abs() < 0.1).float().mean().item()
             rollout_metrics["agnft/y_strong_frac"] = (y_labels.abs() > 0.5).float().mean().item()
@@ -2172,6 +2289,70 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics["rkfac/episode_reward_mean"] = episode_rewards.mean().item()
         rollout_metrics["rkfac/success_rate"] = success_rate.item()
         rollout_metrics["rkfac/n_transitions"] = float((n_steps - 1) * batch_size)
+        return rollout_metrics
+
+    def _compute_flow_qgfm_credit_assignment(self) -> dict:
+        """
+        QGFM credit assignment: build transition data for Q-learning.
+
+        Same structure as RK-FAC: constructs (s_t, a_t, r_t, s_{t+1}, a_{t+1})
+        transition pairs for TD learning.  The Q-gradient perturbation happens
+        in the training loop (not here).
+        """
+        rewards = self.rollout_batch["rewards"]  # [n_steps, batch, chunk]
+        forward_inputs = self.rollout_batch.get("forward_inputs", {})
+        n_steps = rewards.shape[0]
+        batch_size = rewards.shape[1]
+
+        # Episode-level reward for metrics
+        loss_mask = self.rollout_batch.get("loss_mask", None)
+        if loss_mask is not None:
+            episode_rewards = (rewards * loss_mask).sum(dim=(0, 2))
+        else:
+            episode_rewards = rewards.sum(dim=(0, 2))
+        episode_rewards = episode_rewards.clamp(0, 1)
+
+        # Helper: pad first dim from n_steps-1 to n_steps (zero-pad last row)
+        def _pad_to_n(tensor):
+            pad = torch.zeros(1, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, pad], dim=0)
+
+        # VLM embeddings: [n_steps, batch, hidden_dim]
+        vlm_embs = forward_inputs.get("vlm_embedding", None)
+        if vlm_embs is not None:
+            if vlm_embs.dim() == 2:
+                hidden_dim = vlm_embs.shape[-1]
+                vlm_embs = vlm_embs.reshape(n_steps, batch_size, hidden_dim)
+            # Transition pairs for Q-learning, padded to [n_steps, ...]
+            self.rollout_batch["qgfm_vlm_emb_cur"] = _pad_to_n(vlm_embs[:-1])
+            self.rollout_batch["qgfm_vlm_emb_next"] = _pad_to_n(vlm_embs[1:])
+
+        # Actions: [n_steps, batch, chunk, dim]
+        actions = self.rollout_batch["actions"]
+        self.rollout_batch["qgfm_action_cur"] = _pad_to_n(actions[:-1])
+        self.rollout_batch["qgfm_action_next"] = _pad_to_n(actions[1:])
+
+        # Per-step reward (sum over action chunk dim), padded to [n_steps, batch]
+        step_rewards = rewards[:-1].sum(dim=-1)  # [n-1, batch]
+        self.rollout_batch["qgfm_step_rewards"] = _pad_to_n(step_rewards)
+
+        # Valid transition mask: last row is padding
+        qgfm_valid = torch.ones(n_steps, batch_size, device=rewards.device)
+        qgfm_valid[-1] = 0.0
+        self.rollout_batch["qgfm_valid"] = qgfm_valid
+
+        # Dummy advantages/prev_logprobs (QGFM doesn't use, but pipeline needs them)
+        self.rollout_batch["advantages"] = torch.zeros(
+            n_steps, batch_size, device=rewards.device,
+        )
+        if "prev_logprobs" not in self.rollout_batch:
+            self.rollout_batch["prev_logprobs"] = torch.zeros(n_steps, batch_size, 1)
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        success_rate = (episode_rewards > 0.5).float().mean()
+        rollout_metrics["qgfm/episode_reward_mean"] = episode_rewards.mean().item()
+        rollout_metrics["qgfm/success_rate"] = success_rate.item()
+        rollout_metrics["qgfm/n_transitions"] = float((n_steps - 1) * batch_size)
         return rollout_metrics
 
     @Worker.timer("run_training")
@@ -2883,6 +3064,211 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                             metrics_data = {"actor/total_loss": 0.0}
                         # ============ End RK-FAC Branch ============
+                    elif self._is_flow_qgfm:
+                        # ============ QGFM Training Branch ============
+                        # Q-Guided Flow Matching: perturb flow matching target with Q-gradient
+                        # a' = a + η·∇_a Q / ||∇_a Q||, then L = ||v_θ(x_t,t|s) - (ε-a')||²
+                        cfg = self._qgfm_cfg
+
+                        action_chunk = self.cfg.actor.model.get("action_chunk", 5)
+                        action_dim = self.cfg.actor.model.get("action_dim", 7)
+
+                        # --- Critic update: use transition pairs ---
+                        vlm_emb = batch.get("qgfm_vlm_emb_cur", None)
+                        vlm_emb_next = batch.get("qgfm_vlm_emb_next", None)
+                        action_stored = batch.get("qgfm_action_cur", None)
+                        action_next_stored = batch.get("qgfm_action_next", None)
+                        step_reward = batch.get("qgfm_step_rewards", None)
+                        qgfm_valid = batch.get("qgfm_valid", None)
+
+                        has_transitions = (
+                            vlm_emb is not None and vlm_emb.numel() > 0
+                            and action_stored is not None
+                            and step_reward is not None
+                        )
+                        if has_transitions and qgfm_valid is not None:
+                            valid_mask = qgfm_valid.bool()
+                            vlm_emb = vlm_emb[valid_mask]
+                            vlm_emb_next = vlm_emb_next[valid_mask]
+                            action_stored = action_stored[valid_mask]
+                            action_next_stored = action_next_stored[valid_mask]
+                            step_reward = step_reward[valid_mask]
+                            has_transitions = vlm_emb.shape[0] > 0
+
+                        q_loss_val = 0.0
+                        if has_transitions:
+                            bsz_critic = vlm_emb.shape[0]
+
+                            # Flatten actions for Q-network (use real 7-dim action space)
+                            action_flat = action_stored[:, :action_chunk, :action_dim].reshape(bsz_critic, -1)
+                            action_next_flat = action_next_stored[:, :action_chunk, :action_dim].reshape(bsz_critic, -1)
+                            q_dev = next(self._q_network.parameters()).device
+                            vlm_emb_d = vlm_emb.detach().float().to(q_dev)
+                            vlm_emb_next_d = vlm_emb_next.detach().float().to(q_dev)
+                            action_flat_d = action_flat.detach().float().to(q_dev)
+                            action_next_flat_d = action_next_flat.detach().float().to(q_dev)
+                            step_reward = step_reward.to(q_dev)
+
+                            # TD target: y = r + γ·min_j Q̄_j(s', a')
+                            with torch.no_grad():
+                                q_target_vals = self._q_target(
+                                    vlm_emb_next_d, action_next_flat_d,
+                                )  # [batch, 2]
+                                q_target_min = q_target_vals.min(dim=-1).values
+                                td_target = step_reward.float() + cfg["gamma"] * q_target_min
+
+                            q_vals = self._q_network(vlm_emb_d, action_flat_d)  # [batch, 2]
+                            q_loss = 0.5 * (
+                                (q_vals - td_target.unsqueeze(-1).expand_as(q_vals)) ** 2
+                            ).mean()
+
+                            self._q_optimizer.zero_grad()
+                            q_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(
+                                self._q_network.parameters(), cfg["grad_clip"],
+                            )
+                            self._q_optimizer.step()
+                            q_loss_val = q_loss.detach().item()
+
+                        # --- Actor update: Q-gradient perturbed flow matching ---
+                        self._qgfm_update_count += 1
+
+                        # η schedule: 0 during Q warm-up, then ramp from eta_init to eta_max
+                        if self._qgfm_update_count <= cfg["q_warmup_iters"]:
+                            eta = 0.0
+                        else:
+                            progress = min(
+                                1.0,
+                                (self._qgfm_update_count - cfg["q_warmup_iters"])
+                                / max(cfg["eta_warmup_iters"], 1),
+                            )
+                            eta = cfg["eta_init"] + (cfg["eta_max"] - cfg["eta_init"]) * progress
+
+                        do_actor_update = (
+                            eta > 0
+                            and has_transitions
+                            and self._qgfm_update_count % cfg["actor_delay"] == 0
+                        )
+                        _batch_device = batch["actions"].device
+
+                        if do_actor_update:
+                            # Current mini-batch actions and VLM embedding
+                            actions = batch["actions"]  # [batch, chunk, dim]
+                            bsz_actor = actions.shape[0]
+                            device = actions.device
+
+                            # VLM embedding for Q-gradient (from forward_inputs)
+                            vlm_emb_actor = forward_inputs.get("vlm_embedding", None) if forward_inputs is not None else None
+                            if vlm_emb_actor is None:
+                                # Fallback: skip actor update if no VLM embedding
+                                logger.warning("QGFM: vlm_embedding is None in forward_inputs, skipping actor update")
+                                loss = torch.tensor(0.0, device=device, requires_grad=True)
+                            else:
+                                vlm_emb_actor = vlm_emb_actor.detach().float().to(device)
+
+                                # Compute Q-gradient w.r.t. actions for perturbation
+                                a_for_grad = actions[:, :action_chunk, :action_dim].detach().clone().requires_grad_(True)
+                                a_flat_for_q = a_for_grad.reshape(bsz_actor, -1).float()
+                                q_for_perturb = self._q_network(vlm_emb_actor, a_flat_for_q)
+                                q_min_for_perturb = q_for_perturb.min(dim=-1).values.sum()
+                                q_min_for_perturb.backward()
+                                q_grad = a_for_grad.grad.detach()  # [batch, chunk, dim]
+
+                                # Normalize Q-gradient direction
+                                if cfg["norm_q_grad"]:
+                                    q_grad_norm = q_grad.reshape(bsz_actor, -1).norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                                    q_grad_hat = q_grad / q_grad_norm.view(bsz_actor, 1, 1)
+                                else:
+                                    q_grad_hat = q_grad
+
+                                # Perturb target action: a' = a + η·ĝ
+                                a_prime = actions[:, :action_chunk, :action_dim] + eta * q_grad_hat
+                                a_prime = a_prime.detach()  # target, no grad through perturbation
+
+                                # Sample fresh (t, ε) for flow matching
+                                # ε must match the full model-space action shape (padded to 32-dim),
+                                # same as forward_inputs["action"] = outputs["actions"] from rollout.
+                                # actions = batch["actions"] = fi["action"] is already in model space.
+                                t = torch.rand(bsz_actor, 1, 1, device=device)
+                                epsilon = torch.randn_like(actions)  # [batch, horizon, model_dim=32]
+
+                                # Construct flow matching input in model space
+                                # x_t = (1-t)·a + t·ε  (full model-space, passed to model)
+                                x_t = (1 - t) * actions + t * epsilon
+                                # u' = ε[:,:chunk,:dim] - a'  (perturbed velocity target, real action dims only)
+                                u_prime = epsilon[:, :action_chunk, :action_dim] - a_prime
+
+                                # Model forward: v_theta = v_θ(x_t, t | s)
+                                timestep = t.reshape(bsz_actor)
+                                with self.amp_context:
+                                    v_theta = self.model(
+                                        forward_type=ForwardType.VELOCITY,
+                                        forward_inputs=forward_inputs,
+                                        x_t=x_t,
+                                        timestep=timestep,
+                                    )
+
+                                # QGFM loss: λ_q·||v_θ - u'||² + λ_bc·||v_θ - u||²
+                                # The BC term (u = ε - a, original FM target) prevents
+                                # catastrophic forgetting when Q-gradient is noisy.
+                                v_theta_chunk = v_theta[:, :action_chunk, :action_dim]
+                                u_orig = epsilon[:, :action_chunk, :action_dim] - actions[:, :action_chunk, :action_dim]
+
+                                lam_bc = cfg.get("lam_bc", 0.5)
+
+                                diff_q = v_theta_chunk.float() - u_prime.float()
+                                diff_bc = v_theta_chunk.float() - u_orig.float().detach()
+                                per_sample_loss = (
+                                    (diff_q ** 2).sum(dim=-1).mean(dim=-1) * (1.0 - lam_bc)
+                                    + (diff_bc ** 2).sum(dim=-1).mean(dim=-1) * lam_bc
+                                )  # [batch]
+
+                                # Apply loss_mask if available
+                                if loss_mask is not None:
+                                    lm = loss_mask.view(-1) if loss_mask.dim() > 1 else loss_mask
+                                    qgfm_loss = (per_sample_loss * lm).sum() / lm.sum().clamp(min=1)
+                                else:
+                                    qgfm_loss = per_sample_loss.mean()
+
+                                loss = qgfm_loss
+                        else:
+                            # Q warm-up or non-actor-update step: run pure BC (standard FM loss)
+                            # to maintain pre-trained SFT behavior and prevent weight-decay collapse.
+                            _bc_actions = batch["actions"]
+                            _bc_bsz = _bc_actions.shape[0]
+                            _bc_t = torch.rand(_bc_bsz, 1, 1, device=_batch_device)
+                            _bc_eps = torch.randn_like(_bc_actions)
+                            _bc_xt = (1 - _bc_t) * _bc_actions + _bc_t * _bc_eps
+                            _bc_u = _bc_eps[:, :action_chunk, :action_dim] - _bc_actions[:, :action_chunk, :action_dim]
+                            with self.amp_context:
+                                _bc_v = self.model(
+                                    forward_type=ForwardType.VELOCITY,
+                                    forward_inputs=forward_inputs,
+                                    x_t=_bc_xt,
+                                    timestep=_bc_t.reshape(_bc_bsz),
+                                )
+                            _bc_diff = _bc_v[:, :action_chunk, :action_dim].float() - _bc_u.float().detach()
+                            loss = (_bc_diff ** 2).sum(dim=-1).mean()
+
+                        # Target Q-network soft update
+                        if has_transitions:
+                            with torch.no_grad():
+                                for p_tgt, p in zip(
+                                    self._q_target.parameters(),
+                                    self._q_network.parameters(),
+                                ):
+                                    p_tgt.data.mul_(1 - cfg["tau"]).add_(p.data, alpha=cfg["tau"])
+
+                        metrics_data = {
+                            "actor/q_loss": q_loss_val,
+                            "actor/qgfm_loss": loss.detach().item(),
+                            "actor/eta": eta,
+                            "actor/q_mean": q_vals.mean().detach().item() if has_transitions else 0.0,
+                            "actor/td_target_mean": td_target.mean().item() if has_transitions else 0.0,
+                            "actor/q_warmup": 1.0 if self._qgfm_update_count <= cfg["q_warmup_iters"] else 0.0,
+                            "actor/update_count": float(self._qgfm_update_count),
+                        }
+                        # ============ End QGFM Branch ============
                     else:
                         # ============ Original PPO/GRPO Branch ============
                         advantages = batch["advantages"]

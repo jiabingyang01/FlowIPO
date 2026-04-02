@@ -1242,3 +1242,24 @@ def compute_flow_rkfac_loss(
     if actor_loss is None:
         actor_loss = torch.tensor(0.0)
     return actor_loss, {}
+
+
+@register_policy_loss("flow_qgfm")
+def compute_flow_qgfm_loss(
+    actor_loss: torch.Tensor = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    QGFM loss placeholder — actual loss is computed directly in actor worker.
+
+    QGFM = Q-Guided Flow Matching: standard flow matching MSE with Q-gradient
+    perturbed target action.  L = ||v_θ(x_t, t | s) - (ε - a')||²
+    where a' = a + η·∇_a Q(s, a) / ||∇_a Q||.
+
+    The actor worker handles Q-network TD update + target perturbation + flow
+    matching forward.  This registered entry just passes through the pre-computed
+    loss so the registry dispatch system works correctly.
+    """
+    if actor_loss is None:
+        actor_loss = torch.tensor(0.0)
+    return actor_loss, {}

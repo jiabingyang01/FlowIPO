@@ -83,12 +83,21 @@ class MultiStepRolloutWorker(Worker):
         self._is_flow_nft = _loss_type == "flow_nft"
         self._is_flow_hinge_nft = _loss_type == "flow_hinge_nft"
         self._is_flow_rkfac = _loss_type == "flow_rkfac"
-        # NFT/Hinge-NFT/RK-FAC do NOT need EMA ref model
-        # RK-FAC uses frozen initial weights maintained in actor worker (not EMA)
+        self._is_flow_qgfm = _loss_type == "flow_qgfm"
+        # NFT/Hinge-NFT/RK-FAC/QGFM do NOT need EMA ref model
+        # RK-FAC uses frozen initial weights in actor worker; QGFM uses Q-gradient perturbation
         self._needs_ema_ref = self._is_flow_ipo or self._is_flow_sar or self._is_flow_fpi or self._is_flow_awm or self._is_flow_gfn
         if self._needs_ema_ref:
             self._ref_weights_cpu = None
             self._ref_swap_buffer = None
+        # DECO: frozen reference model for deviation computation (captured once, never updated)
+        self._needs_deco_ref = (
+            self._is_flow_nft
+            and cfg.algorithm.get("flow_nft_adv_type", "terminal_binary") == "deco"
+        )
+        if self._needs_deco_ref:
+            self._deco_ref_weights_cpu = None
+            self._deco_ref_swap_buffer = None
         if self._is_flow_ipo:
             self._flow_ipo_beta = cfg.algorithm.get("flow_ipo_beta_ref", 0.995)
         if self._is_flow_fpi:
@@ -126,7 +135,7 @@ class MultiStepRolloutWorker(Worker):
             if self._is_flow_nft or self._is_flow_hinge_nft:
                 rollout_model_config.openpi.use_nft_loss = True
             # VP-PPO / RK-FAC: enable VLM embedding collection
-            if self.cfg.algorithm.get("use_vp_ppo", False) or self._is_flow_rkfac:
+            if self.cfg.algorithm.get("use_vp_ppo", False) or self._is_flow_rkfac or self._is_flow_qgfm:
                 rollout_model_config.openpi.collect_vlm_embedding = True
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
@@ -300,6 +309,12 @@ class MultiStepRolloutWorker(Worker):
                         param_state_dict[k].cpu(), alpha=1 - beta
                     )
 
+        # DECO: capture frozen reference weights on first sync only (SFT checkpoint)
+        if self._needs_deco_ref and self._deco_ref_weights_cpu is None:
+            self._deco_ref_weights_cpu = {
+                k: v.clone().cpu() for k, v in param_state_dict.items()
+            }
+
         self.hf_model.load_state_dict(param_state_dict)
         self.model_weights_id = (
             str(get_model_weights_id(self.hf_model)) + f"_{self.count_update}"
@@ -461,6 +476,64 @@ class MultiStepRolloutWorker(Worker):
                 fi["ref_v"] = v_ref.cpu()
                 fi["flow_t"] = t.cpu()
                 fi["flow_epsilon"] = epsilon.cpu()
+
+    @torch.no_grad()
+    def _compute_deco_ref_deviations(self, rollout_result: EmbodiedRolloutResult):
+        """
+        DECO: compute per-step reference deviation D_i using frozen SFT model.
+
+        For each rollout step's NFT snapshot (x_t, t, v_old), compute:
+            v_ref = pi_ref(x_t, t, s_i)        (frozen reference forward)
+            D_i = ||v_ref - v_old||^2           (per-step scalar)
+
+        Uses cpu_weight_swap to temporarily load frozen SFT weights.
+        Stores deco_ref_deviation in forward_inputs for credit assignment.
+        """
+        from openpi.models import model as _model
+
+        num_steps = self.cfg.actor.model.get("num_steps", 10)
+        schedule = torch.linspace(1, 0, num_steps + 1, device=self.device)
+
+        with cpu_weight_swap(self.hf_model, self._deco_ref_weights_cpu, self._deco_ref_swap_buffer):
+            for fi in rollout_result.forward_inputs:
+                nft_xt = fi.get("nft_xt", None)
+                nft_v = fi.get("nft_v", None)
+                step_idx = fi.get("nft_step_index", None)
+                if nft_xt is None or nft_v is None or step_idx is None:
+                    continue
+
+                # Reconstruct observation from cached "~" keys
+                obs_dict = {}
+                for k, v in fi.items():
+                    if not k.startswith("~"):
+                        continue
+                    parts = k[1:].split("~", 1)
+                    val = v.to(self.device) if torch.is_tensor(v) else v
+                    if len(parts) == 2:
+                        obs_dict.setdefault(parts[0], {})[parts[1]] = val
+                    else:
+                        obs_dict[parts[0]] = val
+                observation = _model.Observation.from_dict(obs_dict)
+
+                # Compute timestep from schedule and step_index
+                x_t = nft_xt.to(self.device)
+                bsz = x_t.shape[0]
+                t = schedule[step_idx.long().to(self.device)]  # [batch]
+
+                # Reference velocity: v_ref = pi_ref(x_t, t, s_i)
+                v_ref = self.hf_model.forward_velocity(
+                    None, x_t, t, observation=observation,
+                )
+
+                # Deviation: D_i = mean(||v_ref - v_old||^2) over action dims
+                v_old = nft_v.to(self.device)
+                # Crop v_ref to match v_old shape (action_chunk)
+                action_chunk = v_old.shape[1]
+                action_dim = v_old.shape[2] if v_old.dim() == 3 else v_old.shape[-1]
+                v_ref_crop = v_ref[:, :action_chunk, :action_dim]
+                D_i = ((v_ref_crop - v_old) ** 2).mean(dim=(-2, -1))  # [batch]
+
+                fi["deco_ref_deviation"] = D_i.cpu()
 
     @torch.no_grad()
     def _compute_self_annotation(self, rollout_result: EmbodiedRolloutResult):
@@ -772,6 +845,11 @@ class MultiStepRolloutWorker(Worker):
                     self._compute_awm_annotations(self.rollout_results[stage_id])
                 elif self._is_flow_gfn:
                     self._compute_gfn_annotations(self.rollout_results[stage_id])
+
+        # DECO: compute reference deviations using frozen SFT model
+        if self._needs_deco_ref and self._deco_ref_weights_cpu is not None:
+            for stage_id in range(self.num_pipeline_stages):
+                self._compute_deco_ref_deviations(self.rollout_results[stage_id])
 
         for stage_id in range(self.num_pipeline_stages):
             await self.send_rollout_trajectories(

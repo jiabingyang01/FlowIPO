@@ -501,6 +501,75 @@ def compute_embedding_change_advantages(
     return advantages
 
 
+def compute_deco_advantages(
+    episode_rewards: torch.Tensor,
+    ref_deviations: torch.Tensor,
+    n_steps: int,
+    adv_clip_max: float = 1.0,
+    eta: float = 2.0,
+) -> tuple[torch.Tensor, dict]:
+    """
+    DECO: Deviation-Enhanced Contrastive Optimization credit assignment.
+
+    Uses the reference model deviation D_i as a step-level importance weight.
+    Core insight: steps where the current policy deviates most from the frozen
+    reference (SFT checkpoint) are likely the key decision points.
+
+    The SIGN always comes from terminal binary (direction always correct).
+    The MAGNITUDE is modulated by sigmoid-normalized deviation weight.
+
+    Formula:
+        w_i = sigmoid((D_i - D_mean) / D_std)       ∈ (0, 1)
+        y_i = (2r - 1) * (1 + η * w_i) * adv_clip_max
+
+    When η=0, strictly degenerates to π-StepNFT terminal binary.
+
+    Args:
+        episode_rewards: Episode-level reward, shape [batch]. Binary (0 or 1).
+        ref_deviations: Per-step reference deviation D_i, shape [n_steps, batch].
+            D_i = ||v_ref - v_old||^2 at sampled denoising step.
+        n_steps: Number of environment steps per episode.
+        adv_clip_max: Advantage clipping range.
+        eta: Deviation modulation strength (only new hyperparameter).
+            η=0 → degenerates to terminal binary.
+            η=2 → max weight ratio ≈ 3x.
+
+    Returns:
+        advantages: Per-step advantages, shape [n_steps, batch].
+        metrics: Dict with DECO-specific diagnostic metrics.
+    """
+    batch_size = episode_rewards.shape[0]
+    device = episode_rewards.device
+
+    # ---- terminal binary direction (never overridden) ----
+    success = (episode_rewards.float() > 0.5).float()  # [batch]
+    terminal_sign = success * 2 - 1  # +1 success, -1 failure
+    terminal_sign = terminal_sign.unsqueeze(0).expand(n_steps, -1)  # [n_steps, batch]
+
+    # ---- batch normalization of deviations ----
+    D_mean = ref_deviations.mean()
+    D_std = ref_deviations.std().clamp(min=1e-8)
+    w = torch.sigmoid((ref_deviations - D_mean) / D_std)  # [n_steps, batch], ∈ (0, 1)
+
+    # ---- step-level label: y_i = (2r-1) * (1 + η * w_i) * adv_clip_max ----
+    advantages = terminal_sign * (1.0 + eta * w) * adv_clip_max  # [n_steps, batch]
+
+    # ---- diagnostic metrics ----
+    metrics = {
+        "deco/D_mean": D_mean.item(),
+        "deco/D_std": D_std.item(),
+        "deco/w_mean": w.mean().item(),
+        "deco/w_std": w.std().item(),
+        "deco/w_min": w.min().item(),
+        "deco/w_max": w.max().item(),
+        "deco/y_abs_mean": advantages.abs().mean().item(),
+        "deco/y_abs_max": advantages.abs().max().item(),
+        "deco/eta": eta,
+    }
+
+    return advantages, metrics
+
+
 def compute_flow_fpi_weights(
     advantages: torch.Tensor,
     lambda_: float = 1.0,
